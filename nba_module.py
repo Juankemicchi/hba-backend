@@ -1,6 +1,7 @@
 from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players
 import pandas as pd
+import time
 
 HEADERS = {
     'Host': 'stats.nba.com',
@@ -13,12 +14,10 @@ def get_player_id(player_name: str):
     player_dict = players.get_players()
     search = player_name.lower().strip()
     
-    # Búsqueda exacta
     for p in player_dict:
         if p['full_name'].lower() == search:
             return p['id'], p['full_name']
     
-    # Búsqueda parcial
     matches = []
     for p in player_dict:
         full = p['full_name'].lower()
@@ -28,7 +27,6 @@ def get_player_id(player_name: str):
     if matches:
         return matches[0]['id'], matches[0]['full_name']
     
-    # Búsqueda por apellido
     for p in player_dict:
         if search in p['last_name'].lower():
             return p['id'], p['full_name']
@@ -41,16 +39,27 @@ def get_player_games(player_name: str, season_type="Regular Season", last_n=15):
     if not player_id:
         raise ValueError(f"Jugador '{player_name}' no encontrado")
     
-    try:
-        logs = playergamelog.PlayerGameLog(
-            player_id=player_id,
-            season="2025-26",
-            season_type_all_star=season_type,
-            headers=HEADERS
-        )
-        df = logs.get_data_frames()[0]
-    except Exception as e:
-        raise ValueError(f"Error al obtener datos: {str(e)}")
+    last_error = None
+    
+    for attempt in range(4):
+        try:
+            logs = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season="2025-26",
+                season_type_all_star=season_type,
+                headers=HEADERS,
+                timeout=90
+            )
+            df = logs.get_data_frames()[0]
+            
+            if not df.empty:
+                break
+        except Exception as e:
+            last_error = e
+            time.sleep(3)
+            continue
+    else:
+        raise ValueError(f"No se pudo obtener datos después de varios intentos: {last_error}")
     
     if df.empty:
         return pd.DataFrame(), full_name
