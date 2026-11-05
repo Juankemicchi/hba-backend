@@ -11,14 +11,27 @@ HEADERS = {
 
 def get_player_id(player_name: str):
     player_dict = players.get_players()
+    search = player_name.lower().strip()
     
+    # Búsqueda exacta
     for p in player_dict:
-        if p['full_name'].lower() == player_name.lower():
+        if p['full_name'].lower() == search:
             return p['id'], p['full_name']
     
-    matches = [p for p in player_dict if player_name.lower() in p['full_name'].lower()]
+    # Búsqueda parcial
+    matches = []
+    for p in player_dict:
+        full = p['full_name'].lower()
+        if search in full or full in search:
+            matches.append(p)
+    
     if matches:
         return matches[0]['id'], matches[0]['full_name']
+    
+    # Búsqueda por apellido
+    for p in player_dict:
+        if search in p['last_name'].lower():
+            return p['id'], p['full_name']
     
     return None, None
 
