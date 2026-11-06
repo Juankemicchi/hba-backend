@@ -2,7 +2,7 @@ import requests
 import pandas as pd
 import os
 
-API_KEY = os.getenv("BALLDONTLIE_API_KEY", "TU_API_KEY_AQUI")
+API_KEY = os.getenv("BALLDONTLIE_API_KEY", "")
 BASE_URL = "https://api.balldontlie.io/v1"
 HEADERS = {"Authorization": API_KEY}
 
@@ -10,16 +10,25 @@ def get_player_id(player_name: str):
     response = requests.get(
         f"{BASE_URL}/players",
         headers=HEADERS,
-        params={"search": player_name, "per_page": 5}
+        params={"search": player_name, "per_page": 10}
     )
+    
+    if response.status_code != 200:
+        raise ValueError(f"Error en la API: {response.status_code}")
+    
     data = response.json().get("data", [])
     
     if not data:
         return None, None
     
+    search = player_name.lower()
+    for player in data:
+        full_name = f"{player['first_name']} {player['last_name']}".lower()
+        if search in full_name or full_name in search:
+            return player["id"], f"{player['first_name']} {player['last_name']}"
+    
     player = data[0]
-    full_name = f"{player['first_name']} {player['last_name']}"
-    return player["id"], full_name
+    return player["id"], f"{player['first_name']} {player['last_name']}"
 
 def get_player_games(player_name: str, last_n: int = 15):
     player_id, full_name = get_player_id(player_name)
@@ -36,6 +45,9 @@ def get_player_games(player_name: str, last_n: int = 15):
             "per_page": last_n
         }
     )
+    
+    if response.status_code != 200:
+        raise ValueError(f"Error al obtener stats: {response.status_code}")
     
     data = response.json().get("data", [])
     
@@ -86,7 +98,6 @@ def analyze_prop(player_name: str, prop: str = "PTS", line: float = 20.5, last_n
         df["RA"] = df["REB"] + df["AST"]
         value_col = "RA"
     elif prop in ["DD", "TD"]:
-        # Simplificado por ahora
         value_col = "PTS"
     else:
         if prop not in df.columns:
