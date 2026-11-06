@@ -41,6 +41,10 @@ def get_player_games(player_name: str, last_n: int = 15):
     
     data = response.json().get("data", [])
     
+    print("=== RESPUESTA DE LA API ===")
+    print(data)
+    print("===========================")
+    
     if not data:
         return pd.DataFrame(), full_name
     
