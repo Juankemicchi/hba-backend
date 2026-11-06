@@ -2,15 +2,15 @@ import requests
 import pandas as pd
 import os
 
-API_KEY = os.getenv("BALLDONTLIE_API_KEY", "")
-BASE_URL = "https://api.balldontlie.io/v1"
-HEADERS = {"Authorization": API_KEY}
+API_KEY = os.getenv("BIGBALLS_API_KEY", "")
+BASE_URL = "https://api.bigballsdata.com/v1"
+HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 
 def get_player_id(player_name: str):
     response = requests.get(
         f"{BASE_URL}/players",
         headers=HEADERS,
-        params={"search": player_name, "per_page": 10}
+        params={"sport": "basketball", "league": "nba", "name": player_name}
     )
     
     if response.status_code != 200:
@@ -21,14 +21,8 @@ def get_player_id(player_name: str):
     if not data:
         return None, None
     
-    search = player_name.lower()
-    for player in data:
-        full_name = f"{player['first_name']} {player['last_name']}".lower()
-        if search in full_name or full_name in search:
-            return player["id"], f"{player['first_name']} {player['last_name']}"
-    
     player = data[0]
-    return player["id"], f"{player['first_name']} {player['last_name']}"
+    return player["id"], player.get("name", player_name)
 
 def get_player_games(player_name: str, last_n: int = 15):
     player_id, full_name = get_player_id(player_name)
@@ -37,13 +31,9 @@ def get_player_games(player_name: str, last_n: int = 15):
         raise ValueError(f"Jugador '{player_name}' no encontrado")
     
     response = requests.get(
-        f"{BASE_URL}/stats",
+        f"{BASE_URL}/players/{player_id}/gamelog",
         headers=HEADERS,
-        params={
-            "player_ids[]": player_id,
-            "seasons[]": 2025,
-            "per_page": last_n
-        }
+        params={"limit": last_n}
     )
     
     if response.status_code != 200:
@@ -55,20 +45,14 @@ def get_player_games(player_name: str, last_n: int = 15):
         return pd.DataFrame(), full_name
     
     rows = []
-    for stat in data:
+    for game in data:
         rows.append({
-            "GAME_DATE": stat["game"]["date"],
-            "MATCHUP": f"{stat['team']['abbreviation']} vs OPP",
-            "PTS": stat.get("pts", 0),
-            "REB": stat.get("reb", 0),
-            "AST": stat.get("ast", 0),
-            "FG3M": stat.get("fg3m", 0),
-            "STL": stat.get("stl", 0),
-            "BLK": stat.get("blk", 0),
-            "MIN": stat.get("min", "0"),
-            "TOV": stat.get("turnover", 0),
-            "FGM": stat.get("fgm", 0),
-            "FGA": stat.get("fga", 0),
+            "GAME_DATE": game.get("date"),
+            "PTS": game.get("points", 0),
+            "REB": game.get("rebounds", 0),
+            "AST": game.get("assists", 0),
+            "FG3M": game.get("three_pointers_made", 0),
+            "MIN": game.get("minutes", 0),
         })
     
     df = pd.DataFrame(rows)
@@ -97,8 +81,6 @@ def analyze_prop(player_name: str, prop: str = "PTS", line: float = 20.5, last_n
     elif prop == "RA":
         df["RA"] = df["REB"] + df["AST"]
         value_col = "RA"
-    elif prop in ["DD", "TD"]:
-        value_col = "PTS"
     else:
         if prop not in df.columns:
             raise ValueError(f"Prop '{prop}' no disponible")
