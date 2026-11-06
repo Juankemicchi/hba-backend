@@ -4,7 +4,7 @@ import os
 
 API_KEY = os.getenv("BALLDONTLIE_API_KEY", "")
 BASE_URL = "https://api.balldontlie.io/v1"
-HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+HEADERS = {"Authorization": API_KEY}
 
 def get_player_id(player_name: str):
     response = requests.get(
