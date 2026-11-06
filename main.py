@@ -33,7 +33,9 @@ def analyze(request: PropRequest):
             last_n=request.last_n
         )
         
-        games = df[['GAME_DATE', 'MATCHUP', stats['value_col'], 'Over']].to_dict(orient='records')
+        # Solo devolver las columnas que existen
+        available_cols = ['GAME_DATE', stats['value_col'], 'Over']
+        games = df[available_cols].to_dict(orient='records')
         
         return {
             "stats": stats,
