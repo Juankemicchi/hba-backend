@@ -47,16 +47,18 @@ def get_player_games(player_name: str, last_n: int = 15):
     rows = []
     for game in data:
         rows.append({
-            "GAME_DATE": game.get("date"),
-            "PTS": game.get("points", 0),
-            "REB": game.get("rebounds", 0),
-            "AST": game.get("assists", 0),
-            "FG3M": game.get("three_pointers_made", 0),
-            "MIN": game.get("minutes", 0),
+            "GAME_DATE": game.get("date") or game.get("game_date"),
+            "PTS": game.get("points") or game.get("pts") or 0,
+            "REB": game.get("rebounds") or game.get("reb") or 0,
+            "AST": game.get("assists") or game.get("ast") or 0,
+            "FG3M": game.get("three_pointers_made") or game.get("fg3m") or 0,
+            "MIN": game.get("minutes") or game.get("min") or 0,
+            "STL": game.get("steals") or game.get("stl") or 0,
+            "BLK": game.get("blocks") or game.get("blk") or 0,
         })
     
     df = pd.DataFrame(rows)
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
     df = df.sort_values("GAME_DATE", ascending=False)
     
     return df.head(last_n), full_name
@@ -81,6 +83,12 @@ def analyze_prop(player_name: str, prop: str = "PTS", line: float = 20.5, last_n
     elif prop == "RA":
         df["RA"] = df["REB"] + df["AST"]
         value_col = "RA"
+    elif prop == "DD":
+        df["DD"] = ((df["PTS"] >= 10).astype(int) + (df["REB"] >= 10).astype(int) + (df["AST"] >= 10).astype(int) >= 2).astype(int)
+        value_col = "DD"
+    elif prop == "TD":
+        df["TD"] = ((df["PTS"] >= 10).astype(int) + (df["REB"] >= 10).astype(int) + (df["AST"] >= 10).astype(int) >= 3).astype(int)
+        value_col = "TD"
     else:
         if prop not in df.columns:
             raise ValueError(f"Prop '{prop}' no disponible")
