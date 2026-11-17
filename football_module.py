@@ -7,8 +7,9 @@ HEADERS = {"X-Auth-Token": API_KEY}
 
 def get_team_id(team_name: str):
     try:
-        # Buscar en competiciones principales
-        competitions = ["PL", "PD", "SA", "BL1", "FL1", "CL"]
+        competitions = ["PL", "PD", "SA", "BL1", "FL1", "CL", "WC"]
+        team_name_lower = team_name.lower()
+        
         for comp in competitions:
             response = requests.get(
                 f"{BASE_URL}/competitions/{comp}/teams",
@@ -18,7 +19,9 @@ def get_team_id(team_name: str):
                 continue
             data = response.json()
             for team in data.get("teams", []):
-                if team_name.lower() in team["name"].lower() or team_name.lower() in team.get("shortName", "").lower():
+                name = team.get("name", "").lower()
+                short = team.get("shortName", "").lower()
+                if team_name_lower in name or team_name_lower in short or name in team_name_lower:
                     return team["id"]
     except Exception as e:
         print("Error buscando equipo:", e)
