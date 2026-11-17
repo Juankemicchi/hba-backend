@@ -26,7 +26,6 @@ BIGBALLS_KEY = os.getenv("BIGBALLS_API_KEY", "")
 HEADERS = {"Authorization": f"Bearer {BIGBALLS_KEY}"}
 BASE_URL = "https://api.bigballsdata.com/v1"
 
-# ==================== MODELOS ====================
 class PropRequest(BaseModel):
     player: str
     prop: str
@@ -35,15 +34,12 @@ class PropRequest(BaseModel):
 
 class FootballTeamRequest(BaseModel):
     team: str
-    league_id: int = 39
-    season: int = 2025
 
 class FootballH2HRequest(BaseModel):
     team1: str
     team2: str
     last: int = 10
 
-# ==================== NBA ====================
 @app.get("/")
 def root():
     return {"message": "HBA Backend activo", "ai": bool(os.getenv("XAI_API_KEY"))}
@@ -53,14 +49,11 @@ def get_upcoming_matchup(player_name: str):
         response = requests.get(
             f"{BASE_URL}/matches",
             headers=HEADERS,
-            params={"sport": "basketball", "league": "nba", "limit": 15}
+            params={"sport": "basketball", "league": "nba", "status": "scheduled", "limit": 15}
         )
         if response.status_code != 200:
             return None
         matches = response.json().get("data", [])
-        for match in matches:
-            if match.get("status") == "scheduled":
-                return match
         return matches[0] if matches else None
     except:
         return None
@@ -73,8 +66,8 @@ def generate_ai_analysis(player: str, prop: str, line: float, avg: float, hit_ra
         away = matchup.get("away", {}).get("name", "Visitante")
         rival_info = f"\nPróximo partido: {away} vs {home}."
 
-    prompt = f"""Eres un analista de apuestas deportivas profesional y experimentado. 
-Habla de forma natural, como un tipster que analiza partidos.
+    prompt = f"""Eres un analista de apuestas deportivas profesional.
+Habla de forma natural.
 
 Datos del jugador:
 - Jugador: {player}
@@ -84,14 +77,7 @@ Datos del jugador:
 - Hit rate: {hit_rate}% ({hits} de {games} partidos)
 {rival_info}
 
-Genera un análisis de 4 a 6 líneas que incluya:
-1. Evaluación del promedio vs la línea.
-2. Consistencia del jugador en los últimos partidos.
-3. Nivel de riesgo del pick.
-4. Menciona el próximo rival (si tienes la información) y cómo puede afectar.
-5. Una conclusión clara (si el over o under tiene valor).
-
-Sé directo, profesional y útil. No uses listas numeradas. Habla en un solo párrafo o dos."""
+Genera un análisis de 4 a 6 líneas que incluya promedio vs línea, consistencia, riesgo y conclusión. Sé directo y profesional."""
 
     try:
         response = client.chat.completions.create(
@@ -144,7 +130,6 @@ def analyze(request: PropRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ==================== FÚTBOL ====================
 @app.post("/football/team")
 def analyze_football_team(request: FootballTeamRequest):
     try:
