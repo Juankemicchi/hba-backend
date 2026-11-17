@@ -7,19 +7,24 @@ HEADERS = {"X-Auth-Token": API_KEY}
 
 def get_team_id(team_name: str):
     try:
-        response = requests.get(
-            f"{BASE_URL}/teams",
-            headers=HEADERS,
-            params={"name": team_name}
-        )
-        data = response.json()
-        if data.get("teams"):
-            return data["teams"][0]["id"]
+        # Buscar en competiciones principales
+        competitions = ["PL", "PD", "SA", "BL1", "FL1", "CL"]
+        for comp in competitions:
+            response = requests.get(
+                f"{BASE_URL}/competitions/{comp}/teams",
+                headers=HEADERS
+            )
+            if response.status_code != 200:
+                continue
+            data = response.json()
+            for team in data.get("teams", []):
+                if team_name.lower() in team["name"].lower() or team_name.lower() in team.get("shortName", "").lower():
+                    return team["id"]
     except Exception as e:
         print("Error buscando equipo:", e)
     return None
 
-def get_team_stats(team_name: str, competition: str = "PL"):
+def get_team_stats(team_name: str):
     team_id = get_team_id(team_name)
     if not team_id:
         return None
@@ -34,22 +39,6 @@ def get_team_stats(team_name: str, competition: str = "PL"):
         print("Error stats equipo:", e)
         return None
 
-def get_team_matches(team_name: str, limit: int = 10):
-    team_id = get_team_id(team_name)
-    if not team_id:
-        return None
-    
-    try:
-        response = requests.get(
-            f"{BASE_URL}/teams/{team_id}/matches",
-            headers=HEADERS,
-            params={"status": "FINISHED", "limit": limit}
-        )
-        return response.json()
-    except Exception as e:
-        print("Error partidos equipo:", e)
-        return None
-
 def get_h2h(team1: str, team2: str, limit: int = 10):
     id1 = get_team_id(team1)
     id2 = get_team_id(team2)
@@ -60,7 +49,7 @@ def get_h2h(team1: str, team2: str, limit: int = 10):
         response = requests.get(
             f"{BASE_URL}/teams/{id1}/matches",
             headers=HEADERS,
-            params={"status": "FINISHED", "limit": 50}
+            params={"status": "FINISHED", "limit": 100}
         )
         data = response.json()
         matches = data.get("matches", [])
