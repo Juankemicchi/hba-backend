@@ -490,6 +490,64 @@ def _lookup_player(player=None, player_id=None):
     return None
 
 
+def _is_international_stat(st):
+    league = st.get("league") or {}
+    typ = (league.get("type") or "").lower()
+    country = (league.get("country") or "").lower()
+    name = (league.get("name") or "").lower()
+    if typ == "international":
+        return True
+    if country in {
+        "world", "europe", "south-america", "south america", "africa", "asia",
+        "north america", "oceania", "fifa", "uefa", "conmebol", "concacaf", "caf", "afc", "ofc",
+    }:
+        return True
+    return any(k in name for k in (
+        "world cup", "euro", "copa america", "nations league", "friendlies",
+        "amistosos", "gold cup", "africa cup", "asian cup", "nations",
+    ))
+
+
+def _stat_apps(st):
+    games = st.get("games") or {}
+    try:
+        apps = int(games.get("appearences") or games.get("appearances") or 0)
+    except (TypeError, ValueError):
+        apps = 0
+    try:
+        minutes = int(games.get("minutes") or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    return apps, minutes
+
+
+def _pick_player_team(stats_list, season, prefer_league=None):
+    candidates = [st for st in (stats_list or []) if (st.get("team") or {}).get("id")]
+    if not candidates:
+        return None
+    if prefer_league:
+        try:
+            lid = int(prefer_league)
+        except (TypeError, ValueError):
+            lid = None
+        matched = [st for st in candidates if lid and (st.get("league") or {}).get("id") == lid]
+        if matched:
+            candidates = matched
+
+    def score(st):
+        apps, minutes = _stat_apps(st)
+        club = 0 if _is_international_stat(st) else 1
+        return (club, apps, minutes)
+
+    best = max(candidates, key=score)
+    team = best.get("team") or {}
+    return {
+        "id": team.get("id"),
+        "name": team.get("name"),
+        "logo": team.get("logo"),
+    }, (best.get("league") or {}).get("season") or season
+
+
 def _player_team(player_id, season, team_id=None, league=None):
     if team_id:
         try:
@@ -500,24 +558,31 @@ def _player_team(player_id, season, team_id=None, league=None):
                 return team, season
         except ValueError:
             pass
-    params = {"id": int(player_id), "season": int(season)}
+
+    def from_season(year, prefer_league=None):
+        try:
+            data = fm.api_get("/players", {"id": int(player_id), "season": int(year)}, ttl=fm.CACHE_TTL_STABLE)
+        except ValueError:
+            return None
+        item = (data.get("response") or [None])[0]
+        if not item:
+            return None
+        return _pick_player_team(item.get("statistics") or [], year, prefer_league)
+
+    picked = from_season(season, league)
+    if picked:
+        return picked
+    # The player may not belong to the selected league; fall back to best club side.
     if league:
-        params["league"] = int(league)
+        picked = from_season(season, None)
+        if picked:
+            return picked
     try:
-        data = fm.api_get("/players", params, ttl=fm.CACHE_TTL_STABLE)
-    except ValueError:
-        return None, season
-    item = (data.get("response") or [None])[0]
-    if not item:
-        return None, season
-    stats = (item.get("statistics") or [{}])[0]
-    team = stats.get("team") or {}
-    if team.get("id"):
-        return {
-            "id": team.get("id"),
-            "name": team.get("name"),
-            "logo": team.get("logo"),
-        }, (stats.get("league") or {}).get("season") or season
+        picked = from_season(int(season) - 1, None)
+        if picked:
+            return picked
+    except (TypeError, ValueError):
+        pass
     return None, season
 
 
