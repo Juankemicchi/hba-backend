@@ -191,23 +191,52 @@ def search_entities(query: str, limit: int = 8):
         players = []
 
     ql = q.lower()
-    def _rank(item, *fields):
-        texts = [(item.get(f) or "").lower() for f in fields]
-        words = []
-        for t in texts:
-            words.extend(t.replace(".", " ").replace("-", " ").split())
-        name = texts[0] if texts else ""
-        if any(t == ql for t in texts):
+    import re
+    qwords = [w for w in ql.replace(".", " ").replace("-", " ").split() if w]
+
+    def _words(s):
+        return (s or "").lower().replace(".", " ").replace("-", " ").split()
+
+    def _rank_team(item):
+        name = (item.get("name") or "").lower()
+        words = _words(name)
+        if name == ql or (qwords and all(w in words or w in name for w in qwords) and name.split()[0:1] == qwords[0:1]):
             return (0, len(name))
-        if ql in words:
+        if qwords and all(w in words for w in qwords):
             return (1, len(name))
-        if any(t.startswith(ql) or t.endswith(ql) for t in texts) or any(w.startswith(ql) for w in words):
+        if any(name.startswith(w) or w in words for w in qwords):
             return (2, len(name))
-        if any(ql in t for t in texts):
+        if ql in name:
             return (3, len(name))
         return (4, 99)
-    teams = sorted(teams, key=lambda x: _rank(x, "name", "code"))[:limit]
-    players = sorted(players, key=lambda x: _rank(x, "name", "fullname"))[:limit]
+
+    def _rank_player(item):
+        name = (item.get("name") or "").lower()
+        full = (item.get("fullname") or "").lower()
+        fw, nw = _words(full), _words(name)
+        blob = set(fw + nw)
+        if not qwords:
+            return (9, 0)
+        if not any(w in blob or w in name or w in full for w in qwords):
+            return (9, 0)
+        last = qwords[-1]
+        initial = bool(re.match(rf"^[a-z]\.?\s+{re.escape(last)}$", name))
+        all_words = all(w in blob or w in name or w in full for w in qwords)
+        if initial and (len(qwords) == 1 or all_words):
+            return (0, -len(fw), -len(full))
+        if all_words and ((fw and fw[-1] == last) or (nw and nw[-1] == last)):
+            return (1, -len(qwords), -len(full))
+        if all_words:
+            return (2, -len(fw), -len(full))
+        if last in fw or last in nw:
+            return (3, -len(fw))
+        return (4, 0)
+
+    teams = [x for x in teams if ql in (x.get("name") or "").lower() or any(w in (x.get("name") or "").lower() for w in qwords)]
+    teams = sorted(teams, key=_rank_team)[:limit]
+    players = [p for p in players if any(w in (p.get("name") or "").lower() or w in (p.get("fullname") or "").lower() for w in qwords)]
+    players = sorted(players, key=_rank_player)[:limit]
+
     return {"teams": teams, "players": players}
 
 

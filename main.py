@@ -18,6 +18,7 @@ from football_stats import (
     MARKET_LABELS,
 )
 from pydantic import BaseModel
+from typing import Optional
 import os
 import requests
 from openai import OpenAI
@@ -63,28 +64,28 @@ class FootballSearchNote:
     pass
 
 class TeamPropsRequest(BaseModel):
-    team: str = None
-    team_id: int = None
-    league: int = None
+    team: Optional[str] = None
+    team_id: Optional[int] = None
+    league: Optional[int] = None
     last_n: int = 10
     venue: str = "all"
-    opponent: str = None
-    opponent_id: int = None
-    lines: dict = None
-    season: int = None
-    market: str = None
+    opponent: Optional[str] = None
+    opponent_id: Optional[int] = None
+    lines: Optional[dict] = None
+    season: Optional[int] = None
+    market: Optional[str] = None
     include_ai: bool = True
 
 class PlayerPropsRequest(BaseModel):
-    player: str = None
-    player_id: int = None
-    team: str = None
-    team_id: int = None
-    league: int = None
+    player: Optional[str] = None
+    player_id: Optional[int] = None
+    team: Optional[str] = None
+    team_id: Optional[int] = None
+    league: Optional[int] = None
     last_n: int = 10
-    lines: dict = None
-    season: int = None
-    market: str = None
+    lines: Optional[dict] = None
+    season: Optional[int] = None
+    market: Optional[str] = None
     include_ai: bool = True
 
 @app.get("/")
