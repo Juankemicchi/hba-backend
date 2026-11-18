@@ -112,7 +112,7 @@ def _cache_set(key, data, ttl):
 def api_get(path: str, params=None, ttl: int = CACHE_TTL_STABLE):
     key_val = os.getenv("BIGBALLS_API_KEY", API_KEY)
     if not key_val:
-        raise ValueError("Falta la variable de entorno BIGBALLS_API_KEY en Render")
+        raise ValueError("Faltan credenciales de datos en este entorno.")
     clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
     key = _cache_key(path, clean)
     cached = _cache_get(key)

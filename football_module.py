@@ -69,7 +69,7 @@ def _raise_api_errors(data):
     if isinstance(errors, dict):
         if "plan" in errors:
             raise ValueError(
-                "El plan de API-Football no incluye esta temporada o este recurso. "
+                "El plan de datos no incluye esta temporada o este recurso. "
                 "Revisa la temporada o el plan contratado."
             )
         msg = "; ".join(f"{k}: {v}" for k, v in errors.items() if v)
@@ -83,7 +83,7 @@ def _raise_api_errors(data):
 
 def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE):
     if not API_KEY:
-        raise ValueError("Falta la variable de entorno API_FOOTBALL_KEY en Render")
+        raise ValueError("Faltan credenciales de datos en este entorno.")
 
     clean_params = {k: v for k, v in params.items() if v is not None and v != ""}
     key = _cache_key(path, clean_params)
@@ -99,9 +99,9 @@ def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE):
         timeout=20,
     )
     if response.status_code == 429:
-        raise ValueError("Se alcanzó el límite de consultas de API-Football. Intenta más tarde.")
+        raise ValueError("Se alcanzó el límite de consultas. Intenta más tarde.")
     if response.status_code != 200:
-        raise ValueError(f"Error en API-Football: {response.status_code}")
+        raise ValueError(f"Error al consultar los datos: {response.status_code}")
 
     data = response.json()
     _cache_set(key, data, ttl)
