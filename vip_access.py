@@ -71,7 +71,7 @@ def public_config() -> dict:
         "supabase_url": url if ready else None,
         "supabase_anon_key": anon if ready else None,
         "access_codes_enabled": bool(_access_codes()),
-        "google": ready,
+        "google": False,
     }
 
 
