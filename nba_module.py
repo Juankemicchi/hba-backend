@@ -236,8 +236,22 @@ def _map_game(game):
         "DD": int((int(pts >= 10) + int(reb >= 10) + int(ast >= 10)) >= 2),
         "TD": int((int(pts >= 10) + int(reb >= 10) + int(ast >= 10)) >= 3),
         "postseason": game.get("postseason"),
+        "is_home": _game_is_home(game),
     }
     return row
+
+
+def _game_is_home(game):
+    for key in ("is_home", "at_home", "home"):
+        val = game.get(key)
+        if isinstance(val, bool):
+            return val
+    loc = str(game.get("location") or game.get("ha") or game.get("home_away") or "").strip().lower()
+    if loc in {"home", "h"}:
+        return True
+    if loc in {"away", "a", "road"}:
+        return False
+    return None
 
 
 def search_players(query: str, limit: int = 8):

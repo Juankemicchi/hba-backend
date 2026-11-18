@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import football_module as fm
 import football_stats as fs
 import nba_module as nba
+import vip_nba_props as nprops
 from openai import OpenAI
 
 BOGOTA = ZoneInfo("America/Bogota")
@@ -87,7 +88,7 @@ def list_vip_competitions() -> dict:
 
 
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
-    return f"v3|{date_str}|{sport}|{league_id or 'all'}|{window}"
+    return f"v4|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
 def _cache_get(key: str):
@@ -197,6 +198,8 @@ def markets_from_analysis(analysis: Optional[dict]) -> list[dict]:
 
 
 def _statistical_reason(pick: dict) -> str:
+    if pick.get("sport") == "nba" and pick.get("kind") == "player_prop":
+        return nprops.statistical_reason(pick)
     line = pick.get("line")
     line_txt = f" {pick.get('selection') or ''} {line}".strip() if line is not None else (pick.get("selection") or "")
     text = (
@@ -247,15 +250,26 @@ def _explain_with_grok(picks: list[dict]) -> list[dict]:
             "implied_prob": pick.get("implied_prob"),
             "bet_name": pick.get("bet_name"),
             "odds_value": pick.get("odds_value"),
+            "kind": pick.get("kind"),
+            "avg": pick.get("avg"),
+            "avg_season": pick.get("avg_season"),
+            "median": pick.get("median"),
+            "avg_minutes": pick.get("avg_minutes"),
+            "line_estimated": pick.get("line_estimated"),
+            "line_label": pick.get("line_label"),
+            "book_line": pick.get("book_line"),
+            "book_source": pick.get("book_source"),
+            "hit_rate_season": pick.get("hit_rate_season"),
         })
     prompt = (
         "Eres el analista VIP de HBA. Escribe UNA frase corta en español por cada pick, "
-        "en el mismo orden. Usa EXCLUSIVAMENTE los números dados (hit rate, hits, games, línea, "
-        "cuota promedio, rango, casas, edge conservador y mercado de casas). "
-        "Menciona la cuota promedio y el edge conservador (ya ajustado por la muestra). "
-        "Si viene bet_name/odds_value, puedes citar ese mercado. "
-        "No trates el hit rate crudo como probabilidad real ni inventes estadísticas, "
-        "lesiones, cuotas ni noticias. No des consejos de apuesta. "
+        "en el mismo orden. Usa EXCLUSIVAMENTE los números dados. "
+        "Si el pick es un prop NBA: menciona el promedio reciente, la mediana, el hit rate "
+        "y deja claro que la línea es una LÍNEA ESTIMADA de HBA, no una cuota de casa, "
+        "salvo que venga book_line/book_source, en cuyo caso cita esa 'línea en casas (vía Grok)' "
+        "y su fuente. No presentes una estimación como cuota real. "
+        "Si el pick es de fútbol: menciona la cuota promedio y el edge conservador. "
+        "No inventes estadísticas, lesiones, cuotas ni noticias. No des consejos de apuesta. "
         "Devuelve un JSON array de strings, nada más.\n\n"
         + json.dumps(compact, ensure_ascii=False)
     )
@@ -1270,6 +1284,28 @@ def _nba_team_candidates(team_name, team_id, fixture: dict) -> list[dict]:
     return out
 
 
+def _rank_nba_props(candidates: list[dict], limit: int = 5) -> list[dict]:
+    seen_player = set()
+    per_game: dict = {}
+    ranked = []
+    for cand in sorted(candidates, key=lambda c: (-(c.get("score") or 0), -(c.get("hit_rate") or 0), -(c.get("games") or 0))):
+        pid = cand.get("entity_id") or cand.get("entity")
+        if pid in seen_player:
+            continue
+        gid = cand.get("fixture_id") or cand.get("match")
+        if per_game.get(gid, 0) >= nprops.MAX_PROPS_PER_GAME:
+            continue
+        seen_player.add(pid)
+        per_game[gid] = per_game.get(gid, 0) + 1
+        ranked.append(cand)
+        if len(ranked) >= limit:
+            break
+    for i, pick in enumerate(ranked, start=1):
+        pick["rank"] = i
+        pick.pop("score", None)
+    return ranked
+
+
 def _rank_top(candidates: list[dict], limit: int = 5) -> list[dict]:
     # Avoid two nearly identical markets from the same match when possible.
     seen = set()
@@ -1365,15 +1401,36 @@ def _build_nba() -> dict:
         if games:
             window = "upcoming"
     games = _trim_fixtures(games)
-    candidates = []
-    for game in games:
-        # One team-history call per side; totals may duplicate — ranking dedupes by market+entity.
-        candidates.extend(_nba_team_candidates(game.get("home"), game.get("home_id"), game))
-        candidates.extend(_nba_team_candidates(game.get("away"), game.get("away_id"), game))
-    picks = _rank_top(candidates, 5)
+    # Player props are the NBA daily product. Team totals remain a fallback only.
+    candidates = nprops.collect_nba_prop_candidates(games)
+    picks = _rank_nba_props(candidates, 5)
+    for pick in picks:
+        pick["kickoff"] = _kickoff_label(pick.get("kickoff"))
+    grok_lines = {"attempted": False, "ok": False, "reason": "no_picks"}
+    if picks:
+        picks, grok_lines = nprops.enrich_props_with_grok_lines(picks)
+    if len(picks) < 5:
+        fallback = []
+        for game in games:
+            fallback.extend(_nba_team_candidates(game.get("home"), game.get("home_id"), game))
+            fallback.extend(_nba_team_candidates(game.get("away"), game.get("away_id"), game))
+        for extra in _rank_top(fallback, 5):
+            if len(picks) >= 5:
+                break
+            if any((p.get("market"), p.get("entity")) == (extra.get("market"), extra.get("entity")) for p in picks):
+                continue
+            picks.append(extra)
+        for i, pick in enumerate(picks, start=1):
+            pick["rank"] = i
+            pick.pop("score", None)
     ai = bool(os.getenv("XAI_API_KEY"))
     if picks:
         picks = _explain_with_grok(picks)
+    empty = None
+    if not games:
+        empty = "No hay partidos NBA programados hoy ni mañana."
+    elif not picks:
+        empty = "No hay props NBA con muestra, minutos y línea estimada suficientes para esta pizarra."
     return {
         "date": today,
         "window": window,
@@ -1382,8 +1439,9 @@ def _build_nba() -> dict:
         "fixtures": _public_fixtures(games, "nba"),
         "picks": picks,
         "ai_explained": bool(ai and picks),
-        "empty_reason": None if games else "No hay partidos NBA programados hoy ni mañana.",
-        "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad. Las razones describen únicamente las cifras calculadas por HBA.",
+        "empty_reason": empty,
+        "grok_lines": grok_lines,
+        "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad. Las líneas NBA marcadas como estimadas no son cuotas de casas de apuestas.",
     }
 
 
@@ -1409,10 +1467,11 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
         else:
             football = _build_football(league_id)
             nba_part = _build_nba()
-            # Top 5 prefers football picks with bookmaker odds/edge.
-            # NBA stays available on the NBA tab; it has no odds source here.
-            merged = list(football.get("picks") or [])
-            picks = _rank_top(merged, 5)
+            # Mix: up to 3 football value picks and up to 2 NBA props, clearly labeled.
+            picks = nprops._mix_all_picks(football.get("picks") or [], nba_part.get("picks") or [], 5)
+            for i, pick in enumerate(picks, start=1):
+                pick["rank"] = i
+                pick.pop("score", None)
             result = {
                 "date": today,
                 "window": football.get("window") if football.get("fixtures") else nba_part.get("window"),
