@@ -48,7 +48,7 @@ FOOTBALL_COMPETITIONS = [
 ALL_LEAGUE_IDS = [c["id"] for c in FOOTBALL_COMPETITIONS]
 
 # Modest default "all" set — popular + local. Still capped at MAX_FIXTURES.
-ALL_PRIORITY_IDS = [239, 39, 140, 2, 135, 13]
+ALL_PRIORITY_IDS = [239, 71, 39, 140, 2, 135, 13]
 
 _cache_lock = threading.Lock()
 _memory_cache: dict = {}
@@ -356,7 +356,7 @@ def _bogota_date(iso_str: Optional[str]) -> Optional[str]:
     return dt.date().isoformat() if dt else None
 
 
-def _collect_football_fixtures(league_id: Optional[int], dates_bogota: list[str]) -> list[dict]:
+def _collect_football_fixtures(league_id: Optional[int], dates_bogota: list[str], ids: Optional[list[int]] = None) -> list[dict]:
     """Fetch fixtures whose kickoff falls on the given America/Bogota calendar days.
 
     API-Football filters by UTC date, so a late Colombian kickoff can appear on the
@@ -372,7 +372,7 @@ def _collect_football_fixtures(league_id: Optional[int], dates_bogota: list[str]
     while cursor <= last:
         utc_dates.append(cursor.isoformat())
         cursor += timedelta(days=1)
-    league_ids = [int(league_id)] if league_id else ALL_PRIORITY_IDS
+    league_ids = [int(league_id)] if league_id else list(ids or ALL_PRIORITY_IDS)
     fixtures = []
     seen = set()
     for lid in league_ids:
@@ -1577,7 +1577,8 @@ def _public_fixtures(fixtures: list[dict], sport: str) -> list[dict]:
 def _build_football(league_id: Optional[int]) -> dict:
     today = _today()
     window = "today"
-    fixtures = _upcoming_only(_collect_football_fixtures(league_id, [today]))
+    today_ids = None if league_id else ALL_LEAGUE_IDS
+    fixtures = _upcoming_only(_collect_football_fixtures(league_id, [today], ids=today_ids))
     if not fixtures:
         upcoming_days = [
             (datetime.now(BOGOTA).date() + timedelta(days=i)).isoformat()
