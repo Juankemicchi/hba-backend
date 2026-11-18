@@ -1163,6 +1163,35 @@ def _iter_rows(payload):
     return []
 
 
+
+def _nba_games_on_bogota_days(dates_bogota: list[str]) -> list[dict]:
+    """Collect NBA games whose tipoff falls on the given Bogotá dates."""
+    query_dates = set(dates_bogota)
+    for d in dates_bogota:
+        try:
+            query_dates.add((datetime.fromisoformat(d).date() + timedelta(days=1)).isoformat())
+        except ValueError:
+            continue
+    found: list[dict] = []
+    seen = set()
+    for q in sorted(query_dates):
+        for game in _nba_games_on_date(q):
+            key = game.get("game_id") or (game.get("home"), game.get("away"), game.get("kickoff"))
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(game)
+    for d in dates_bogota:
+        found = _fill_nba_kickoffs(found, d)
+    want = set(dates_bogota)
+    keep = []
+    for game in found:
+        dt = _parse_kickoff(game.get("kickoff"))
+        if dt and dt.date().isoformat() in want:
+            keep.append(game)
+    return keep
+
+
 def _nba_games_on_date(date_str: str) -> list[dict]:
     if not os.getenv("BIGBALLS_API_KEY"):
         return []
@@ -1595,10 +1624,16 @@ def _build_nba() -> dict:
             "empty_reason": "NBA no disponible: falta BIGBALLS_API_KEY en este entorno.",
             "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad.",
         }
-    games = _nba_games_on_date(today)
+    # BigBalls (and many NBA feeds) date games in UTC, so a 19:00 Bogotá
+    # tipoff lives on the next UTC date. Query today+tomorrow and keep the
+    # games whose kickoff falls on the requested Bogotá calendar day(s).
+    games = _nba_games_on_bogota_days([today])
     if not games:
-        tomorrow = (datetime.now(BOGOTA).date() + timedelta(days=1)).isoformat()
-        games = _nba_games_on_date(tomorrow)
+        upcoming_days = [
+            (datetime.now(BOGOTA).date() + timedelta(days=i)).isoformat()
+            for i in range(1, 3)
+        ]
+        games = _nba_games_on_bogota_days(upcoming_days)
         if games:
             window = "upcoming"
     games = _trim_fixtures(games, NBA_MAX_FIXTURES)
