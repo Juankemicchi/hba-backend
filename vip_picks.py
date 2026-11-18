@@ -1834,35 +1834,56 @@ def _cached_slate(sport: str, league_id: Optional[int], allow_stale: bool = True
 
 def _compute_slate(sport: str, league_id: Optional[int], reuse: bool = True) -> dict:
     today = _today()
-    if sport == "nba":
-        result = _build_nba()
-    elif sport == "football":
-        result = _build_football(league_id)
-    else:
-        football = None
-        nba_part = None
-        if reuse:
-            _, fb_hit = _cached_slate("football", league_id, allow_stale=True)
-            _, nba_hit = _cached_slate("nba", None, allow_stale=True)
-            if fb_hit:
-                football = copy.deepcopy(fb_hit["data"])
-            if nba_hit:
-                nba_part = copy.deepcopy(nba_hit["data"])
-        if football is None:
-            football = _build_football(league_id)
-            football["cached"] = False
-            football["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
-            _cache_set(_cache_key("football", league_id, today, "auto"), football)
-        if nba_part is None:
-            nba_part = _build_nba()
-            nba_part["cached"] = False
-            nba_part["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
-            _cache_set(_cache_key("nba", None, today, "auto"), nba_part)
-        result = _assemble_all(football, nba_part, league_id)
-    result["cached"] = False
-    result["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
-    _cache_set(_cache_key(sport, league_id, today, "auto"), result)
-    return result
+    key = _cache_key(sport, league_id, today, "auto")
+    ev = None
+    wait_for = None
+    with _cache_lock:
+        found = _cache_lookup(key, allow_stale=False)
+        if found:
+            out = copy.deepcopy(found["data"])
+            out["cached"] = True
+            return out
+        if key in _inflight:
+            wait_for = _inflight[key]
+        else:
+            ev = threading.Event()
+            _inflight[key] = ev
+    if wait_for is not None:
+        wait_for.wait(timeout=240)
+        found = _cache_lookup(key, allow_stale=True)
+        if found:
+            out = copy.deepcopy(found["data"])
+            out["cached"] = True
+            return out
+        raise RuntimeError("No se pudieron calcular los picks.")
+    try:
+        if sport == "nba":
+            result = _build_nba()
+        elif sport == "football":
+            result = _build_football(league_id)
+        else:
+            football = None
+            nba_part = None
+            if reuse:
+                _, fb_hit = _cached_slate("football", league_id, allow_stale=True)
+                _, nba_hit = _cached_slate("nba", None, allow_stale=True)
+                if fb_hit:
+                    football = copy.deepcopy(fb_hit["data"])
+                if nba_hit:
+                    nba_part = copy.deepcopy(nba_hit["data"])
+            if football is None:
+                football = _compute_slate("football", league_id, reuse=reuse)
+            if nba_part is None:
+                nba_part = _compute_slate("nba", None, reuse=reuse)
+            result = _assemble_all(football, nba_part, league_id)
+        result["cached"] = False
+        result["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
+        _cache_set(key, result)
+        return result
+    finally:
+        ev.set()
+        with _cache_lock:
+            _inflight.pop(key, None)
 
 
 def _schedule_refresh(sport: str, league_id: Optional[int], key: str):
@@ -1898,39 +1919,7 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
         if found.get("stale"):
             _schedule_refresh(sport, league_id, key)
         return out
-
-    ev = None
-    wait_for = None
-    with _cache_lock:
-        found = _cache_lookup(key, allow_stale=True)
-        if found:
-            out = copy.deepcopy(found["data"])
-            out["cached"] = True
-            if found.get("stale"):
-                _schedule_refresh(sport, league_id, key)
-            return out
-        if key in _inflight:
-            wait_for = _inflight[key]
-        else:
-            ev = threading.Event()
-            _inflight[key] = ev
-
-    if wait_for is not None:
-        wait_for.wait(timeout=180)
-        found = _cache_lookup(key, allow_stale=True)
-        if found:
-            out = copy.deepcopy(found["data"])
-            out["cached"] = True
-            return out
-        raise RuntimeError("No se pudieron calcular los picks.")
-
-    try:
-        result = _compute_slate(sport, league_id, reuse=True)
-        return result
-    finally:
-        ev.set()
-        with _cache_lock:
-            _inflight.pop(key, None)
+    return _compute_slate(sport, league_id, reuse=True)
 
 
 def _warm_targets():
@@ -1953,11 +1942,11 @@ def warm_picks_cache(force: bool = False) -> dict:
         _compute_slate(sport, league_id, reuse=True)
         return "ok", f"{sport}:{league_id or 'all'}"
 
-    # Leagues + NBA first (fixture work is shared with Todos). Two at a time
-    # so we stay inside typical API-Football Pro per-minute limits.
-    first = [(s, lid) for s, lid in _warm_targets() if s != "all"]
+    # Todos first: NBA + the combined football slate, then assemble "all".
+    # Individual leagues follow, two at a time, to stay within typical
+    # API-Football Pro per-minute limits and share fixture work.
     with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
-        futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in first}
+        futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in (("nba", None), ("football", None))}
         for fut in as_completed(futs):
             try:
                 kind, label = fut.result()
@@ -1970,6 +1959,16 @@ def warm_picks_cache(force: bool = False) -> dict:
         report[kind].append(label)
     except Exception as exc:
         report["errors"].append(f"all:{type(exc).__name__}")
+    rest = [("football", lid) for lid in ALL_LEAGUE_IDS]
+    with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
+        futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in rest}
+        for fut in as_completed(futs):
+            try:
+                kind, label = fut.result()
+                report[kind].append(label)
+            except Exception as exc:
+                s, lid = futs[fut]
+                report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
     return report
 
 
