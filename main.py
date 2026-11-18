@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from nba_module import (
     analyze_prop,
@@ -24,6 +24,18 @@ from football_stats import (
     analyze_player_props,
     MARKET_LABELS,
 )
+from vip_access import (
+    require_vip,
+    require_admin,
+    public_config,
+    set_user_vip,
+    supabase_admin_ready,
+    payment_secret,
+    apply_vip_from_payment,
+)
+from vip_picks import list_vip_competitions, get_daily_picks
+from vip_slip import SlipRequest, analyze_slip
+from vip_chat import ChatRequest, vip_chat
 from pydantic import BaseModel
 from typing import Optional, Union, Any, List
 import os
@@ -44,8 +56,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Placeholder key keeps import working if XAI_API_KEY is unset (local tests).
+# Calls are still guarded with os.getenv("XAI_API_KEY").
 client = OpenAI(
-    api_key=os.getenv("XAI_API_KEY"),
+    api_key=os.getenv("XAI_API_KEY") or "missing-xai-key",
     base_url="https://api.x.ai/v1",
 )
 
@@ -784,3 +798,72 @@ def market_insight(request: InsightRequest):
             ev.set()
             with _insight_mutex:
                 _insight_inflight.pop(key, None)
+
+
+class AdminVipRequest(BaseModel):
+    email: Optional[str] = None
+    user_id: Optional[str] = None
+    is_vip: bool = True
+
+
+@app.get("/api/vip/config")
+def vip_config():
+    return public_config()
+
+
+@app.get("/api/vip/me")
+def vip_me(user=Depends(require_vip)):
+    return {"ok": True, "source": user.source, "is_vip": True, "email": user.email}
+
+
+@app.get("/api/vip/competitions")
+def vip_competitions(_user=Depends(require_vip)):
+    return list_vip_competitions()
+
+
+@app.get("/api/vip/picks")
+def vip_picks(sport: str = "all", league: Optional[int] = None, _user=Depends(require_vip)):
+    try:
+        return get_daily_picks(sport=sport, league_id=league)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/vip/slip")
+def vip_analyze_slip(request: SlipRequest, _user=Depends(require_vip)):
+    try:
+        return analyze_slip(request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/vip/chat")
+def vip_chat_route(request: ChatRequest, _user=Depends(require_vip)):
+    try:
+        return vip_chat(request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/admin/vip")
+def admin_set_vip(request: AdminVipRequest, _admin=Depends(require_admin)):
+    if not supabase_admin_ready():
+        raise HTTPException(status_code=503, detail="Supabase no está configurado")
+    return set_user_vip(email=request.email, user_id=request.user_id, is_vip=request.is_vip)
+
+
+@app.post("/api/vip/webhooks/mercadopago")
+async def vip_webhook_mercadopago(request: Request):
+    if not payment_secret("mercadopago"):
+        return {"ok": False, "detail": "Pasarela Mercado Pago no configurada"}
+    # Hook: verify signature with MERCADOPAGO_WEBHOOK_SECRET, map payer to profiles, set is_vip.
+    _ = await request.body()
+    return {"ok": False, "detail": "Webhook recibido; el procesamiento se activará cuando la pasarela esté conectada"}
+
+
+@app.post("/api/vip/webhooks/wompi")
+async def vip_webhook_wompi(request: Request):
+    if not payment_secret("wompi"):
+        return {"ok": False, "detail": "Pasarela Wompi no configurada"}
+    _ = await request.body()
+    return {"ok": False, "detail": "Webhook recibido; el procesamiento se activará cuando la pasarela esté conectada"}
