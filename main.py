@@ -11,6 +11,12 @@ from football_module import (
     get_standings,
     DEFAULT_LEAGUE,
 )
+from football_stats import (
+    search_entities,
+    analyze_team_props,
+    analyze_player_props,
+    MARKET_LABELS,
+)
 from pydantic import BaseModel
 import os
 import requests
@@ -52,6 +58,34 @@ class FootballH2HRequest(BaseModel):
     last: int = 10
     league: int = None
     season: int = None
+
+class FootballSearchNote:
+    pass
+
+class TeamPropsRequest(BaseModel):
+    team: str = None
+    team_id: int = None
+    league: int = None
+    last_n: int = 10
+    venue: str = "all"
+    opponent: str = None
+    opponent_id: int = None
+    lines: dict = None
+    season: int = None
+    market: str = None
+    include_ai: bool = True
+
+class PlayerPropsRequest(BaseModel):
+    player: str = None
+    player_id: int = None
+    team: str = None
+    team_id: int = None
+    league: int = None
+    last_n: int = 10
+    lines: dict = None
+    season: int = None
+    market: str = None
+    include_ai: bool = True
 
 @app.get("/")
 def root():
@@ -318,6 +352,144 @@ def football_squad(team: int):
         data = get_squad(team)
         if not data.get("players"):
             raise HTTPException(status_code=404, detail="No se encontró la plantilla")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _fmt_market(m):
+    if not m or not m.get("games"):
+        return "sin datos"
+    return f"{m.get('label')}: promedio {m.get('avg')} vs línea {m.get('line')}, hit rate {m.get('hit_rate')}% ({m.get('hits')}/{m.get('games')})"
+
+
+def _fmt_match_line(row, key):
+    date = (row.get("date") or "")[:10]
+    val = row.get(key)
+    score = row.get("score") or ""
+    return f"- {date} vs {row.get('opponent')} ({row.get('venue')}, {score}): {val}"
+
+
+def generate_props_analysis(kind: str, name: str, ctx: dict, market_key: str = None):
+    stats = ctx.get("stats") or {}
+    primary = market_key or ctx.get("primary")
+    rec = ctx.get("recommendation") or {}
+    markets_txt = "\n".join(_fmt_market(m) for m in stats.values() if m and m.get("games"))
+    series = (stats.get(primary) or {}).get("values") or []
+    recent = "\n".join(_fmt_match_line(v, "value") for v in series[:8])
+    rec_txt = f"Inclinación calculada: {rec.get('lean')} {rec.get('line')} {rec.get('label')} (confianza {rec.get('confidence')}/5)."
+    extra = ""
+    if kind == "team":
+        record = ctx.get("record") or {}
+        extra = f"Forma {ctx.get('form') or '-'} · {record.get('wins')}W-{record.get('draws')}E-{record.get('losses')}D en {record.get('played')} partidos."
+        if ctx.get("h2h"):
+            h2h_lines = []
+            for m in (ctx.get("h2h") or [])[:5]:
+                h2h_lines.append(f"- {(m.get('date') or '')[:10]} {m.get('home')} {m.get('goals_home')}-{m.get('goals_away')} {m.get('away')}")
+            extra += "\nH2H reciente:\n" + "\n".join(h2h_lines)
+    else:
+        team = (ctx.get("team") or {}).get("name") or ""
+        extra = f"Equipo: {team}. Partidos con minutos: {ctx.get('played')}. Portero: {ctx.get('is_goalkeeper')}."
+
+    prompt = f"""Eres un analista de apuestas deportivas profesional.
+Habla en español, breve y basado solo en los datos. 4 a 6 líneas, sin listas numeradas.
+
+{kind.upper()}: {name}
+Temporada: {ctx.get('season')}  Últimos partidos: {ctx.get('last_n')}
+{extra}
+
+Mercados:
+{markets_txt}
+
+Detalle del mercado principal ({MARKET_LABELS.get(primary, primary)}):
+{recent or 'sin serie'}
+
+{rec_txt}
+
+Cierra con estas dos líneas exactas al final:
+RECOMENDACIÓN: OVER|UNDER|NEUTRAL <línea> <mercado>
+CONFIANZA: <1-5>/5
+Sé directo. Menciona consistencia, riesgo y si el promedio sostiene la línea."""
+
+    try:
+        response = client.chat.completions.create(
+            model="grok-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=350,
+            temperature=0.6
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error al generar análisis: {str(e)}"
+
+
+@app.get("/api/football/search")
+def football_search(q: str = "", query: str = ""):
+    try:
+        term = (q or query or "").strip()
+        return search_entities(term)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/football/analyze/team")
+def football_analyze_team(request: TeamPropsRequest):
+    try:
+        if not request.team and not request.team_id:
+            raise HTTPException(status_code=422, detail="Indica un equipo")
+        data = analyze_team_props(
+            team=request.team,
+            team_id=request.team_id,
+            league=request.league,
+            last_n=request.last_n,
+            venue=request.venue,
+            opponent=request.opponent,
+            opponent_id=request.opponent_id,
+            lines=request.lines,
+            season=request.season,
+            market=request.market,
+        )
+        if not data:
+            raise HTTPException(status_code=404, detail="No se encontraron datos del equipo")
+        name = (data.get("team") or {}).get("name") or request.team
+        if request.include_ai:
+            data["ai_analysis"] = generate_props_analysis("team", name, data, request.market)
+        else:
+            data["ai_analysis"] = None
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/football/analyze/player")
+def football_analyze_player(request: PlayerPropsRequest):
+    try:
+        if not request.player and not request.player_id:
+            raise HTTPException(status_code=422, detail="Indica un jugador")
+        data = analyze_player_props(
+            player=request.player,
+            player_id=request.player_id,
+            team=request.team,
+            team_id=request.team_id,
+            league=request.league,
+            last_n=request.last_n,
+            lines=request.lines,
+            season=request.season,
+            market=request.market,
+        )
+        if not data:
+            raise HTTPException(status_code=404, detail="No se encontraron datos del jugador")
+        name = (data.get("player") or {}).get("fullname") or (data.get("player") or {}).get("name") or request.player
+        if request.include_ai and data.get("matches"):
+            data["ai_analysis"] = generate_props_analysis("player", name, data, request.market)
+        elif not data.get("matches"):
+            data["ai_analysis"] = data.get("error") or "No hay partidos recientes con minutos para este jugador."
+        else:
+            data["ai_analysis"] = None
         return data
     except HTTPException:
         raise
