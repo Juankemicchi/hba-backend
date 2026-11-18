@@ -87,7 +87,7 @@ def list_vip_competitions() -> dict:
 
 
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
-    return f"v2|{date_str}|{sport}|{league_id or 'all'}|{window}"
+    return f"v3|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
 def _cache_get(key: str):
@@ -204,13 +204,20 @@ def _statistical_reason(pick: dict) -> str:
         f"{pick.get('market_label')} {line_txt} acertó el {pick.get('hit_rate')}% "
         f"({pick.get('hits')}/{pick.get('games')})."
     )
+    if pick.get("bet_name"):
+        mercado = pick["bet_name"]
+        if pick.get("odds_value"):
+            mercado += f" · {pick['odds_value']}"
+        text += f" Mercado de casas: {mercado}."
     if pick.get("avg_odd") is not None:
         text += (
             f" Cuota promedio {pick['avg_odd']} "
             f"({pick.get('odd_min')}–{pick.get('odd_max')}, {pick.get('bookmakers')} casas). "
-            f"Edge {pick.get('edge')} p.p. frente a la probabilidad implícita "
-            f"({pick.get('implied_prob')}%)."
+            f"Edge conservador {pick.get('edge')} p.p. frente a la probabilidad implícita "
+            f"({pick.get('implied_prob')}%), ajustado por el tamaño de la muestra."
         )
+        if pick.get("edge_flag") and pick.get("edge_raw") is not None:
+            text += f" El edge crudo de la muestra sería {pick['edge_raw']} p.p."
     return text
 
 
@@ -236,13 +243,19 @@ def _explain_with_grok(picks: list[dict]) -> list[dict]:
             "odd_max": pick.get("odd_max"),
             "bookmakers": pick.get("bookmakers"),
             "edge": pick.get("edge"),
+            "edge_raw": pick.get("edge_raw"),
             "implied_prob": pick.get("implied_prob"),
+            "bet_name": pick.get("bet_name"),
+            "odds_value": pick.get("odds_value"),
         })
     prompt = (
         "Eres el analista VIP de HBA. Escribe UNA frase corta en español por cada pick, "
         "en el mismo orden. Usa EXCLUSIVAMENTE los números dados (hit rate, hits, games, línea, "
-        "cuota promedio, rango, casas y edge). Menciona la cuota y si el edge es positivo. "
-        "No inventes estadísticas, lesiones, cuotas ni noticias. No des consejos de apuesta. "
+        "cuota promedio, rango, casas, edge conservador y mercado de casas). "
+        "Menciona la cuota promedio y el edge conservador (ya ajustado por la muestra). "
+        "Si viene bet_name/odds_value, puedes citar ese mercado. "
+        "No trates el hit rate crudo como probabilidad real ni inventes estadísticas, "
+        "lesiones, cuotas ni noticias. No des consejos de apuesta. "
         "Devuelve un JSON array de strings, nada más.\n\n"
         + json.dumps(compact, ensure_ascii=False)
     )
@@ -576,12 +589,17 @@ PREFERRED_TEAM_MARKETS = (
 
 
 MIN_ODD = 1.40
-MIN_BOOKS = 2
+MIN_BOOKS = 3
+MIN_BOOKS_PAIR = 2
 MIN_HIT = 60
 MIN_GAMES = 5
 MIN_EDGE = 0.0
+MAX_EDGE = 25.0
+OUTLIER_DEV = 0.25
+PAIR_AGREE = 0.10
+SHRINK_K = 8
 
-# API-Football /odds bet IDs
+# API-Football /odds bet IDs — strict whitelist (full-time, no Asian/handicap/halves).
 ODDS_MATCH_WINNER = 1
 ODDS_GOALS_OU = 5
 ODDS_BTTS = 8
@@ -593,6 +611,45 @@ ODDS_CORNERS_AWAY = 58
 ODDS_CARDS_OU = 80
 ODDS_CARDS_HOME = 82
 ODDS_CARDS_AWAY = 83
+
+# Accepted names (case-insensitive) for each whitelisted bet id.
+ALLOWED_BETS: dict[int, set[str]] = {
+    ODDS_MATCH_WINNER: {"match winner"},
+    ODDS_GOALS_OU: {"goals over/under"},
+    ODDS_BTTS: {"both teams score"},
+    ODDS_GOALS_HOME: {"total - home"},
+    ODDS_GOALS_AWAY: {"total - away"},
+    ODDS_CORNERS_OU: {"corners over under", "corners over/under"},
+    ODDS_CORNERS_HOME: {"home corners over/under"},
+    ODDS_CORNERS_AWAY: {"away corners over/under"},
+    ODDS_CARDS_OU: {"cards over/under"},
+    ODDS_CARDS_HOME: {"home team total cards"},
+    ODDS_CARDS_AWAY: {"away team total cards"},
+}
+BET_CANONICAL_NAME = {
+    ODDS_MATCH_WINNER: "Match Winner",
+    ODDS_GOALS_OU: "Goals Over/Under",
+    ODDS_BTTS: "Both Teams Score",
+    ODDS_GOALS_HOME: "Total - Home",
+    ODDS_GOALS_AWAY: "Total - Away",
+    ODDS_CORNERS_OU: "Corners Over Under",
+    ODDS_CORNERS_HOME: "Home Corners Over/Under",
+    ODDS_CORNERS_AWAY: "Away Corners Over/Under",
+    ODDS_CARDS_OU: "Cards Over/Under",
+    ODDS_CARDS_HOME: "Home Team Total Cards",
+    ODDS_CARDS_AWAY: "Away Team Total Cards",
+}
+OU_BET_IDS = {
+    ODDS_GOALS_OU, ODDS_GOALS_HOME, ODDS_GOALS_AWAY,
+    ODDS_CORNERS_OU, ODDS_CORNERS_HOME, ODDS_CORNERS_AWAY,
+    ODDS_CARDS_OU, ODDS_CARDS_HOME, ODDS_CARDS_AWAY,
+}
+EXCLUDED_BET_NAME = re.compile(
+    r"half|1st|2nd|second|first|asian|handicap|exact|race|odd/?even|"
+    r"1x2|3[ -]?way|double chance|ht/?ft|range|between|multi|european",
+    re.I,
+)
+OU_VALUE_RE = re.compile(r"^(Over|Under)\s+([0-9]+(?:[.,][0-9]+)?)$", re.I)
 
 # Match-level markets use both teams' recent match totals and realistic floors.
 MATCH_MARKETS = {
@@ -652,22 +709,85 @@ def _parse_odd(raw) -> Optional[float]:
     return val
 
 
-def _parse_ou_label(label: str) -> Optional[tuple[str, float]]:
-    if not label:
-        return None
-    m = re.search(r"(over|under)\s+([0-9]+(?:[.,][0-9]+)?)", str(label), re.I)
-    if not m:
-        return None
-    side = "Over" if m.group(1).lower() == "over" else "Under"
+def _bet_allowed(bet_id, bet_name: str) -> bool:
     try:
-        line = float(m.group(2).replace(",", "."))
-    except ValueError:
+        bid = int(bet_id)
+    except (TypeError, ValueError):
+        return False
+    names = ALLOWED_BETS.get(bid)
+    if not names:
+        return False
+    label = (bet_name or "").strip()
+    if not label or EXCLUDED_BET_NAME.search(label):
+        return False
+    return label.casefold() in names
+
+
+def _parse_odds_value(raw, bet_id: int) -> Optional[tuple[str, Optional[float], str]]:
+    """Return (side, line_or_None, canonical_value) only for exact allowed formats."""
+    if not raw:
         return None
-    return side, line
+    text = str(raw).strip()
+    if bet_id in OU_BET_IDS:
+        m = OU_VALUE_RE.fullmatch(text)
+        if not m:
+            return None
+        side = "Over" if m.group(1).lower() == "over" else "Under"
+        try:
+            line = float(m.group(2).replace(",", "."))
+        except ValueError:
+            return None
+        # Prefer classic .5 lines later; still index integer lines as fallback.
+        canon = f"{side} {m.group(2).replace(',', '.')}"
+        return side, line, canon
+    low = text.casefold()
+    if bet_id == ODDS_BTTS:
+        if low in {"yes", "sí", "si"}:
+            return "Yes", None, "Yes"
+        if low == "no":
+            return "No", None, "No"
+        return None
+    if bet_id == ODDS_MATCH_WINNER:
+        if low == "home":
+            return "Home", None, "Home"
+        if low == "away":
+            return "Away", None, "Away"
+        if low == "draw":
+            return "Draw", None, "Draw"
+        return None
+    return None
+
+
+def _consensus_odds(pairs: list[tuple[float, str]]) -> Optional[dict]:
+    """Average book odds after dropping outliers. Need 3 books, or 2 that agree within 10%."""
+    if len(pairs) < MIN_BOOKS_PAIR:
+        return None
+    odds = [o for o, _ in pairs]
+    med = statistics.median(odds)
+    if med <= 0:
+        return None
+    kept = [(o, b) for o, b in pairs if abs(o - med) / med <= OUTLIER_DEV]
+    if len(kept) >= MIN_BOOKS:
+        pass
+    elif len(kept) == MIN_BOOKS_PAIR:
+        a, b_ = kept[0][0], kept[1][0]
+        mid = (a + b_) / 2.0
+        if mid <= 0 or abs(a - b_) / mid > PAIR_AGREE:
+            return None
+    else:
+        return None
+    odds_list = [o for o, _ in kept]
+    return {
+        "avg": round(sum(odds_list) / len(odds_list), 2),
+        "min": round(min(odds_list), 2),
+        "max": round(max(odds_list), 2),
+        "n": len(odds_list),
+        "books": sorted({b for _, b in kept}),
+    }
 
 
 def get_fixture_odds(fixture_id) -> dict:
-    """Index bookmaker odds for a fixture. Cached with the football API cache."""
+    """Index only whitelisted full-time markets. Cached with the football API cache."""
     if not fixture_id:
         return {}
     try:
@@ -675,56 +795,52 @@ def get_fixture_odds(fixture_id) -> dict:
     except Exception:
         return {}
     item = (data.get("response") or [None])[0] or {}
-    # {bet_id: {(side, line_or_None): {odds: [..], books: set}}}
-    index = {}
+    # {bet_id: {(side, line_or_None): [(odd, book), ...]}}
+    collected: dict = {}
+    names_seen: dict = {}
+    values_seen: dict = {}
     for book in item.get("bookmakers") or []:
         bname = book.get("name") or "book"
         for bet in book.get("bets") or []:
             bid = bet.get("id")
-            if bid is None:
+            bname_mkt = bet.get("name") or ""
+            if not _bet_allowed(bid, bname_mkt):
                 continue
-            bucket = index.setdefault(int(bid), {})
+            bid = int(bid)
+            names_seen[bid] = bname_mkt
+            bucket = collected.setdefault(bid, {})
+            used_books = bucket.setdefault("_used", {})
             for entry in bet.get("values") or []:
+                parsed = _parse_odds_value(entry.get("value"), bid)
+                if not parsed:
+                    continue
                 odd = _parse_odd(entry.get("odd"))
                 if odd is None:
                     continue
-                raw = str(entry.get("value") or "").strip()
-                parsed = _parse_ou_label(raw)
-                if parsed:
-                    key = parsed
-                else:
-                    low = raw.lower()
-                    if low in {"yes", "sí", "si"}:
-                        key = ("Yes", None)
-                    elif low in {"no"}:
-                        key = ("No", None)
-                    elif low in {"home"}:
-                        key = ("Home", None)
-                    elif low in {"away"}:
-                        key = ("Away", None)
-                    elif low in {"draw"}:
-                        key = ("Draw", None)
-                    else:
-                        continue
-                slot = bucket.setdefault(key, {"odds": [], "books": set()})
-                if bname not in slot["books"]:
-                    slot["books"].add(bname)
-                    slot["odds"].append(odd)
+                side, line, canon = parsed
+                key = (side, line)
+                values_seen[(bid, key)] = canon
+                slot_books = used_books.setdefault(key, set())
+                if bname in slot_books:
+                    continue
+                slot_books.add(bname)
+                bucket.setdefault(key, []).append((odd, bname))
     summary = {}
-    for bid, lines in index.items():
+    for bid, lines in collected.items():
         out = {}
-        for key, slot in lines.items():
-            odds_list = slot["odds"]
-            if not odds_list:
+        for key, pairs in lines.items():
+            if key == "_used":
                 continue
-            out[key] = {
-                "avg": round(sum(odds_list) / len(odds_list), 2),
-                "min": round(min(odds_list), 2),
-                "max": round(max(odds_list), 2),
-                "n": len(odds_list),
-                "books": sorted(slot["books"]),
-            }
-        summary[bid] = out
+            info = _consensus_odds(pairs)
+            if not info:
+                continue
+            info["bet_id"] = bid
+            info["bet_name"] = BET_CANONICAL_NAME.get(bid) or names_seen.get(bid)
+            info["odds_value"] = values_seen.get((bid, key))
+            info["verified"] = True
+            out[key] = info
+        if out:
+            summary[bid] = out
     return summary
 
 
@@ -746,30 +862,64 @@ def _available_lines(odds_index: dict, bet_id: Optional[int], min_line: float) -
     if not odds_index or not bet_id:
         return []
     table = odds_index.get(int(bet_id)) or {}
-    lines = sorted({ln for (side, ln) in table.keys() if ln is not None and ln + 1e-9 >= float(min_line)})
-    # Prefer classic .5 lines
+    by_line: dict[float, int] = {}
+    for (side, ln), info in table.items():
+        if ln is None or ln + 1e-9 < float(min_line):
+            continue
+        by_line[ln] = max(by_line.get(ln, 0), int(info.get("n") or 0))
+    if not by_line:
+        return []
+    # If a liquid main line exists (3+ books), ignore thin alternative lines.
+    if any(n >= MIN_BOOKS for n in by_line.values()):
+        by_line = {ln: n for ln, n in by_line.items() if n >= MIN_BOOKS}
+    lines = sorted(by_line)
     half = [ln for ln in lines if abs(ln - int(ln) - 0.5) < 0.01]
     return half or lines
 
 
+def _shrunk_hit(hits: float, games: int, implied_pct: float, k: int = SHRINK_K) -> float:
+    """Blend the sample hit rate toward the market implied probability."""
+    if games <= 0:
+        return implied_pct
+    phat = 100.0 * float(hits) / float(games)
+    return (games * phat + k * implied_pct) / (games + k)
+
+
 def _attach_odds(cand: dict, info: Optional[dict]) -> Optional[dict]:
-    if not info or info.get("n", 0) < MIN_BOOKS or info.get("avg", 0) < MIN_ODD:
+    if not info or not info.get("verified"):
+        return None
+    if info.get("n", 0) < MIN_BOOKS_PAIR or info.get("avg", 0) < MIN_ODD:
         return None
     avg = float(info["avg"])
     implied = 100.0 / avg
     hit = float(cand["hit_rate"])
-    edge = round(hit - implied, 1)
+    games = int(cand.get("games") or 0)
+    hits = float(cand.get("hits") or 0)
+    raw_edge = round(hit - implied, 1)
+    adj_hit = _shrunk_hit(hits, games, implied)
+    edge = round(adj_hit - implied, 1)
     if edge < MIN_EDGE:
+        return None
+    # Conservative edge still above 25% is almost certainly a mismatch or a tiny sample.
+    if edge > MAX_EDGE:
         return None
     cand["avg_odd"] = avg
     cand["odd_min"] = info["min"]
     cand["odd_max"] = info["max"]
     cand["bookmakers"] = info["n"]
+    cand["bookmaker_names"] = info.get("books") or []
     cand["implied_prob"] = round(implied, 1)
     cand["edge"] = edge
-    cand["score"] = edge * 2.0 + hit * 0.4 + min(int(cand.get("games") or 0), 12)
-    cand["risk"] = _risk(hit, int(cand.get("games") or 0))
-    cand["confidence"] = _confidence(hit, int(cand.get("games") or 0), cand.get("selection") or "")
+    cand["edge_raw"] = raw_edge
+    cand["hit_rate_adj"] = round(adj_hit, 1)
+    cand["edge_flag"] = raw_edge > MAX_EDGE
+    cand["odds_verified"] = True
+    cand["bet_id"] = info.get("bet_id")
+    cand["bet_name"] = info.get("bet_name")
+    cand["odds_value"] = info.get("odds_value")
+    cand["score"] = edge * 2.0 + adj_hit * 0.4 + min(games, 12)
+    cand["risk"] = _risk(hit, games)
+    cand["confidence"] = _confidence(hit, games, cand.get("selection") or "")
     return cand
 
 
@@ -819,21 +969,21 @@ def _best_ou_from_values(fx, values, min_line, bet_id, odds_index, market, label
     offered = _available_lines(odds_index, bet_id, min_line)
     if not offered:
         return None
-    # Prefer the offered .5 line closest to the median, then try neighbors.
+    # Use only the offered .5 line closest to the historical median.
+    # If neither side qualifies, try the next-closest line — do not shop easier lines for fat odds.
     ranked_lines = sorted(offered, key=lambda ln: (abs(ln - target), ln))
-    best = None
-    for line in ranked_lines[:6]:
+    for line in ranked_lines[:2]:
+        options = []
         for side in ("Over", "Under"):
             info = _odds_lookup(odds_index, bet_id, side, line)
             cand = _build_ou_candidate(
                 fx, values, line, side, market, label, entity, entity_id, entity_side, logo, note, info,
             )
-            if not cand:
-                continue
-            if best is None or cand["score"] > best["score"]:
-                best = cand
-        # Strong match on the median-adjacent line is enough; still scan a few.
-    return best
+            if cand:
+                options.append(cand)
+        if options:
+            return max(options, key=lambda c: c.get("score") or 0)
+    return None
 
 
 def _picks_for_football_fixture(fx: dict) -> list[dict]:
@@ -1125,6 +1275,12 @@ def _rank_top(candidates: list[dict], limit: int = 5) -> list[dict]:
     seen = set()
     ranked = []
     for cand in sorted(candidates, key=lambda c: (-(c.get("score") or 0), -(c.get("games") or 0))):
+        # Top 5 football value picks must have a verified bookmaker market and a capped edge.
+        if cand.get("sport") == "football":
+            if not cand.get("odds_verified"):
+                continue
+            if cand.get("edge") is None or cand.get("edge") > MAX_EDGE:
+                continue
         key = (cand.get("fixture_id") or cand.get("match"), cand.get("market"), cand.get("entity"))
         if key in seen:
             continue
