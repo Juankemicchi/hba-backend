@@ -693,6 +693,8 @@ def analyze_player_props(player=None, player_id=None, team=None, team_id=None, l
 
     team_id = team_info["id"]
     season_totals = _season_player_totals(player_id, season, team_id, league)
+    if league and (not season_totals or not season_totals.get("leagues")):
+        season_totals = _season_player_totals(player_id, season, team_id, None)
     fixtures = _season_finished_fixtures(team_id, season, "all")
     if not fixtures:
         fixtures = _finished_fixtures(team_id, 30, "all", clamp=False)
