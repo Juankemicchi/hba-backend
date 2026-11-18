@@ -193,13 +193,19 @@ def search_entities(query: str, limit: int = 8):
     ql = q.lower()
     def _rank(item, *fields):
         texts = [(item.get(f) or "").lower() for f in fields]
+        words = []
+        for t in texts:
+            words.extend(t.replace(".", " ").replace("-", " ").split())
+        name = texts[0] if texts else ""
         if any(t == ql for t in texts):
-            return 0
-        if any(t.startswith(ql) for t in texts):
-            return 1
+            return (0, len(name))
+        if ql in words:
+            return (1, len(name))
+        if any(t.startswith(ql) or t.endswith(ql) for t in texts) or any(w.startswith(ql) for w in words):
+            return (2, len(name))
         if any(ql in t for t in texts):
-            return 2
-        return 3
+            return (3, len(name))
+        return (4, 99)
     teams = sorted(teams, key=lambda x: _rank(x, "name", "code"))[:limit]
     players = sorted(players, key=lambda x: _rank(x, "name", "fullname"))[:limit]
     return {"teams": teams, "players": players}
