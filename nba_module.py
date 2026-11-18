@@ -34,6 +34,17 @@ NBA_MARKETS = [
 NBA_LABELS = {k: label for k, label, _ in NBA_MARKETS}
 DEFAULT_LINES = {k: default for k, _label, default in NBA_MARKETS}
 
+CURRENT_NBA_TEAMS = {
+    "Atlanta Hawks", "Boston Celtics", "Brooklyn Nets", "Charlotte Hornets",
+    "Chicago Bulls", "Cleveland Cavaliers", "Dallas Mavericks", "Denver Nuggets",
+    "Detroit Pistons", "Golden State Warriors", "Houston Rockets", "Indiana Pacers",
+    "LA Clippers", "Los Angeles Clippers", "Los Angeles Lakers", "Memphis Grizzlies",
+    "Miami Heat", "Milwaukee Bucks", "Minnesota Timberwolves", "New Orleans Pelicans",
+    "New York Knicks", "Oklahoma City Thunder", "Orlando Magic", "Philadelphia 76ers",
+    "Phoenix Suns", "Portland Trail Blazers", "Sacramento Kings", "San Antonio Spurs",
+    "Toronto Raptors", "Utah Jazz", "Washington Wizards",
+}
+
 POPULAR_TEAM_NAMES = [
     "Los Angeles Lakers",
     "Boston Celtics",
@@ -147,10 +158,13 @@ def snap_half(value, default=0.5):
 
 
 def _map_player(item):
-    if not item:
+    if not item or not isinstance(item, dict):
         return None
+    team_obj = item.get("team") or item.get("current_team") or {}
+    if not isinstance(team_obj, dict):
+        team_obj = {}
     native = item.get("nba_id") or item.get("league_player_id") or item.get("person_id") or item.get("external_id")
-    photo = item.get("headshot_url") or item.get("photo")
+    photo = item.get("headshot_url") or item.get("photo") or item.get("image_url")
     # Only use the official NBA CDN when the source exposes a numeric NBA person id.
     if not photo and native is not None:
         try:
@@ -165,8 +179,8 @@ def _map_player(item):
         "position": item.get("position"),
         "number": item.get("jersey_number") or item.get("shirt_number"),
         "photo": photo,
-        "team_id": item.get("team_id") or item.get("current_team_id"),
-        "team_name": item.get("team_name"),
+        "team_id": item.get("team_id") or item.get("current_team_id") or team_obj.get("id"),
+        "team_name": item.get("team_name") or team_obj.get("name"),
         "nationality": item.get("nationality"),
         "age": item.get("age"),
     }
@@ -282,9 +296,27 @@ def search_nba(query: str, limit: int = 8):
 
 
 def list_nba_teams():
-    data = api_get("/teams", {"sport": "basketball", "league": "nba", "limit": 50}, ttl=CACHE_TTL_STABLE)
-    teams = [_map_team(item) for item in data.get("data") or [] if item]
-    teams = [t for t in teams if t and t.get("id")]
+    rows = []
+    offset = 0
+    while offset < 400:
+        data = api_get("/teams", {"sport": "basketball", "league": "nba", "limit": 50, "offset": offset}, ttl=CACHE_TTL_STABLE)
+        batch = data.get("data") or []
+        if not batch:
+            break
+        rows.extend(batch)
+        total = ((data.get("pagination") or {}).get("total")) or 0
+        offset += len(batch)
+        if total and offset >= total:
+            break
+        if len(batch) < 50:
+            break
+    seen = {}
+    for item in rows:
+        team = _map_team(item)
+        name = (team or {}).get("name") or ""
+        if team and team.get("id") and name in CURRENT_NBA_TEAMS and name not in seen:
+            seen[name] = team
+    teams = list(seen.values())
     teams.sort(key=lambda t: (not t.get("popular"), t.get("name") or ""))
     return teams
 
