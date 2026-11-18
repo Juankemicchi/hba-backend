@@ -1,0 +1,18 @@
+name: Keep Render awake
+
+on:
+  schedule:
+    # Every 12 minutes during useful hours in America/Bogota (UTC-5): 7:00-23:59.
+    - cron: "*/12 12-23 * * *"
+    - cron: "*/12 0-4 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping HBA backend health
+        run: |
+          curl -fsS --retry 3 --retry-delay 5 --max-time 30 \
+            "https://hba-backend.onrender.com/health"

@@ -33,7 +33,7 @@ from vip_access import (
     payment_secret,
     apply_vip_from_payment,
 )
-from vip_picks import list_vip_competitions, get_daily_picks
+from vip_picks import list_vip_competitions, get_daily_picks, start_picks_background
 from vip_slip import SlipRequest, analyze_slip
 from vip_chat import ChatRequest, vip_chat
 from pydantic import BaseModel
@@ -116,6 +116,16 @@ class PlayerPropsRequest(BaseModel):
 @app.get("/")
 def root():
     return {"message": "HBA Backend activo", "ai": bool(os.getenv("XAI_API_KEY"))}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.on_event("startup")
+def _start_background_jobs():
+    start_picks_background()
 
 def get_upcoming_matchup(player_name: str):
     try:

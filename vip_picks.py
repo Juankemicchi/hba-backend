@@ -6,13 +6,16 @@ computed numbers. It never invents hit rates or sample sizes.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
-import urllib.request
 import statistics
 import os
 import threading
 import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -26,10 +29,12 @@ from openai import OpenAI
 
 BOGOTA = ZoneInfo("America/Bogota")
 SLATE_TTL = 45 * 60
+STALE_MAX = 12 * 60 * 60
 MAX_FIXTURES = 6
 NBA_MAX_FIXTURES = 12
 LAST_N = 8
 CACHE_FILE = Path(os.getenv("VIP_PICKS_CACHE_FILE", "/tmp/hba_vip_picks_cache.json"))
+WARM_WORKERS = 2
 
 FOOTBALL_COMPETITIONS = [
     {"id": 239, "name": "Liga BetPlay", "sport": "football"},
@@ -52,6 +57,12 @@ ALL_PRIORITY_IDS = [239, 71, 39, 140, 2, 135, 13]
 
 _cache_lock = threading.Lock()
 _memory_cache: dict = {}
+_fixture_picks_lock = threading.Lock()
+_fixture_picks_cache: dict = {}
+_inflight: dict = {}
+_refreshing: set = set()
+_bg_started = False
+_bg_lock = threading.Lock()
 
 
 def _today() -> str:
@@ -115,36 +126,130 @@ def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str)
     return f"v6|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
-def _cache_get(key: str):
-    now = time.time()
-    item = _memory_cache.get(key)
-    if item and now - item.get("ts", 0) < SLATE_TTL:
-        return item.get("data")
+def _cache_fresh(item: Optional[dict], now: Optional[float] = None, allow_stale: bool = False):
+    if not item:
+        return None
+    now = now if now is not None else time.time()
+    ts = float(item.get("ts") or 0)
+    age = now - ts
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return None
+    date_str = data.get("date")
+    if date_str and date_str != _today():
+        return None
+    if age < SLATE_TTL:
+        return {"data": data, "ts": ts, "age": age, "stale": False}
+    if allow_stale and age < STALE_MAX:
+        return {"data": data, "ts": ts, "age": age, "stale": True}
+    return None
+
+
+def _supabase_rest():
+    url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
+    if not url or not key:
+        return None, None
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    return url, headers
+
+
+def _supabase_cache_get(key: str):
+    url, headers = _supabase_rest()
+    if not url:
+        return None
     try:
-        if CACHE_FILE.exists():
-            store = json.loads(CACHE_FILE.read_text())
-            item = store.get(key)
-            if item and now - item.get("ts", 0) < SLATE_TTL:
-                _memory_cache[key] = item
-                return item.get("data")
+        q = urllib.parse.quote(key, safe="")
+        req = urllib.request.Request(
+            f"{url}/rest/v1/vip_picks_cache?cache_key=eq.{q}&select=ts,date_str,payload",
+            headers=headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            rows = json.loads(resp.read().decode())
+        if not rows:
+            return None
+        row = rows[0]
+        return {"ts": float(row.get("ts") or 0), "data": row.get("payload")}
+    except Exception:
+        return None
+
+
+def _supabase_cache_set(key: str, item: dict):
+    url, headers = _supabase_rest()
+    if not url:
+        return
+    try:
+        hdrs = dict(headers)
+        hdrs["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        payload = json.dumps({
+            "cache_key": key,
+            "ts": item.get("ts"),
+            "date_str": (item.get("data") or {}).get("date") or _today(),
+            "payload": item.get("data"),
+        }).encode()
+        req = urllib.request.Request(
+            f"{url}/rest/v1/vip_picks_cache?on_conflict=cache_key",
+            data=payload,
+            headers=hdrs,
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=8).read()
     except Exception:
         pass
+
+
+def _cache_lookup(key: str, allow_stale: bool = False):
+    now = time.time()
+    with _cache_lock:
+        found = _cache_fresh(_memory_cache.get(key), now, allow_stale=allow_stale)
+        if found:
+            return found
+        item = None
+        try:
+            if CACHE_FILE.exists():
+                store = json.loads(CACHE_FILE.read_text())
+                item = (store or {}).get(key)
+        except Exception:
+            item = None
+        found = _cache_fresh(item, now, allow_stale=allow_stale)
+        if found:
+            _memory_cache[key] = {"ts": found["ts"], "data": found["data"]}
+            return found
+    remote = _supabase_cache_get(key)
+    found = _cache_fresh(remote, now, allow_stale=allow_stale)
+    if found:
+        with _cache_lock:
+            _memory_cache[key] = {"ts": found["ts"], "data": found["data"]}
+        return found
     return None
+
+
+def _cache_get(key: str):
+    found = _cache_lookup(key, allow_stale=False)
+    return found["data"] if found else None
 
 
 def _cache_set(key: str, data: dict):
     item = {"ts": time.time(), "data": data}
-    _memory_cache[key] = item
-    try:
-        store = {}
-        if CACHE_FILE.exists():
-            store = json.loads(CACHE_FILE.read_text()) or {}
-        now = time.time()
-        store = {k: v for k, v in store.items() if now - v.get("ts", 0) < SLATE_TTL * 2}
-        store[key] = item
-        CACHE_FILE.write_text(json.dumps(store, ensure_ascii=False))
-    except Exception:
-        pass
+    with _cache_lock:
+        _memory_cache[key] = item
+        try:
+            store = {}
+            if CACHE_FILE.exists():
+                store = json.loads(CACHE_FILE.read_text()) or {}
+            now = time.time()
+            store = {k: v for k, v in store.items() if now - v.get("ts", 0) < STALE_MAX}
+            store[key] = item
+            CACHE_FILE.write_text(json.dumps(store, ensure_ascii=False))
+        except Exception:
+            pass
+    _supabase_cache_set(key, item)
 
 
 def _xai_client() -> Optional[OpenAI]:
@@ -1039,6 +1144,21 @@ def _best_ou_from_values(fx, values, min_line, bet_id, odds_index, market, label
 
 
 def _picks_for_football_fixture(fx: dict) -> list[dict]:
+    fid = fx.get("fixture_id")
+    fx_key = f"fx|{_today()}|{fid}" if fid else None
+    if fx_key:
+        with _fixture_picks_lock:
+            item = _fixture_picks_cache.get(fx_key)
+            if item and time.time() - item.get("ts", 0) < SLATE_TTL:
+                return copy.deepcopy(item.get("data") or [])
+    result = _picks_for_football_fixture_compute(fx)
+    if fx_key:
+        with _fixture_picks_lock:
+            _fixture_picks_cache[fx_key] = {"ts": time.time(), "data": copy.deepcopy(result)}
+    return result
+
+
+def _picks_for_football_fixture_compute(fx: dict) -> list[dict]:
     home_id, away_id = fx.get("home_id"), fx.get("away_id")
     league_id = fx.get("league_id")
     if not home_id or not away_id or not league_id:
@@ -1683,6 +1803,86 @@ def _build_nba() -> dict:
     }
 
 
+def _assemble_all(football: dict, nba_part: dict, league_id: Optional[int] = None) -> dict:
+    today = _today()
+    picks = nprops._mix_all_picks(football.get("picks") or [], nba_part.get("picks") or [], 5)
+    for i, pick in enumerate(picks, start=1):
+        pick["rank"] = i
+        pick.pop("score", None)
+    return {
+        "date": today,
+        "window": football.get("window") if football.get("fixtures") else nba_part.get("window"),
+        "timezone": "America/Bogota",
+        "sport": "all",
+        "league": league_id,
+        "fixtures": (football.get("fixtures") or []) + (nba_part.get("fixtures") or []),
+        "picks": picks,
+        "ai_explained": bool((football.get("ai_explained") or nba_part.get("ai_explained")) and picks),
+        "empty_reason": None if (football.get("fixtures") or nba_part.get("fixtures")) else "No hay partidos programados hoy ni mañana.",
+        "parts": {
+            "football_empty": football.get("empty_reason"),
+            "nba_empty": nba_part.get("empty_reason"),
+        },
+        "disclaimer": football.get("disclaimer") or nba_part.get("disclaimer") or "+18. Apuesta bajo tu propia responsabilidad.",
+    }
+
+
+def _cached_slate(sport: str, league_id: Optional[int], allow_stale: bool = True):
+    key = _cache_key(sport, league_id, _today(), "auto")
+    return key, _cache_lookup(key, allow_stale=allow_stale)
+
+
+def _compute_slate(sport: str, league_id: Optional[int], reuse: bool = True) -> dict:
+    today = _today()
+    if sport == "nba":
+        result = _build_nba()
+    elif sport == "football":
+        result = _build_football(league_id)
+    else:
+        football = None
+        nba_part = None
+        if reuse:
+            _, fb_hit = _cached_slate("football", league_id, allow_stale=True)
+            _, nba_hit = _cached_slate("nba", None, allow_stale=True)
+            if fb_hit:
+                football = copy.deepcopy(fb_hit["data"])
+            if nba_hit:
+                nba_part = copy.deepcopy(nba_hit["data"])
+        if football is None:
+            football = _build_football(league_id)
+            football["cached"] = False
+            football["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
+            _cache_set(_cache_key("football", league_id, today, "auto"), football)
+        if nba_part is None:
+            nba_part = _build_nba()
+            nba_part["cached"] = False
+            nba_part["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
+            _cache_set(_cache_key("nba", None, today, "auto"), nba_part)
+        result = _assemble_all(football, nba_part, league_id)
+    result["cached"] = False
+    result["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
+    _cache_set(_cache_key(sport, league_id, today, "auto"), result)
+    return result
+
+
+def _schedule_refresh(sport: str, league_id: Optional[int], key: str):
+    with _cache_lock:
+        if key in _refreshing or key in _inflight:
+            return
+        _refreshing.add(key)
+
+    def _run():
+        try:
+            _compute_slate(sport, league_id, reuse=True)
+        except Exception:
+            pass
+        finally:
+            with _cache_lock:
+                _refreshing.discard(key)
+
+    threading.Thread(target=_run, name=f"vip-refresh-{key[-24:]}", daemon=True).start()
+
+
 def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict:
     sport = (sport or "all").lower()
     if sport in {"football", "futbol", "fútbol"}:
@@ -1691,42 +1891,104 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
         sport = "all"
     today = _today()
     key = _cache_key(sport, league_id, today, "auto")
+    found = _cache_lookup(key, allow_stale=True)
+    if found:
+        out = copy.deepcopy(found["data"])
+        out["cached"] = True
+        if found.get("stale"):
+            _schedule_refresh(sport, league_id, key)
+        return out
+
+    ev = None
+    wait_for = None
     with _cache_lock:
-        cached = _cache_get(key)
-        if cached:
-            out = dict(cached)
+        found = _cache_lookup(key, allow_stale=True)
+        if found:
+            out = copy.deepcopy(found["data"])
+            out["cached"] = True
+            if found.get("stale"):
+                _schedule_refresh(sport, league_id, key)
+            return out
+        if key in _inflight:
+            wait_for = _inflight[key]
+        else:
+            ev = threading.Event()
+            _inflight[key] = ev
+
+    if wait_for is not None:
+        wait_for.wait(timeout=180)
+        found = _cache_lookup(key, allow_stale=True)
+        if found:
+            out = copy.deepcopy(found["data"])
             out["cached"] = True
             return out
+        raise RuntimeError("No se pudieron calcular los picks.")
 
-        if sport == "nba":
-            result = _build_nba()
-        elif sport == "football":
-            result = _build_football(league_id)
-        else:
-            football = _build_football(league_id)
-            nba_part = _build_nba()
-            # Mix: up to 3 football value picks and up to 2 NBA props, clearly labeled.
-            picks = nprops._mix_all_picks(football.get("picks") or [], nba_part.get("picks") or [], 5)
-            for i, pick in enumerate(picks, start=1):
-                pick["rank"] = i
-                pick.pop("score", None)
-            result = {
-                "date": today,
-                "window": football.get("window") if football.get("fixtures") else nba_part.get("window"),
-                "timezone": "America/Bogota",
-                "sport": "all",
-                "league": league_id,
-                "fixtures": (football.get("fixtures") or []) + (nba_part.get("fixtures") or []),
-                "picks": picks,
-                "ai_explained": bool((football.get("ai_explained") or nba_part.get("ai_explained")) and picks),
-                "empty_reason": None if (football.get("fixtures") or nba_part.get("fixtures")) else "No hay partidos programados hoy ni mañana.",
-                "parts": {
-                    "football_empty": football.get("empty_reason"),
-                    "nba_empty": nba_part.get("empty_reason"),
-                },
-                "disclaimer": football.get("disclaimer"),
-            }
-        result["cached"] = False
-        result["generated_at"] = datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
-        _cache_set(key, result)
+    try:
+        result = _compute_slate(sport, league_id, reuse=True)
         return result
+    finally:
+        ev.set()
+        with _cache_lock:
+            _inflight.pop(key, None)
+
+
+def _warm_targets():
+    targets = [("nba", None), ("football", None)]
+    for lid in ALL_LEAGUE_IDS:
+        targets.append(("football", lid))
+    targets.append(("all", None))
+    return targets
+
+
+def warm_picks_cache(force: bool = False) -> dict:
+    """Precompute NBA, each football league, then Todos. Reuses fixture/slate cache."""
+    report = {"ok": [], "skipped": [], "errors": []}
+
+    def _one(sport: str, league_id: Optional[int]):
+        key = _cache_key(sport, league_id, _today(), "auto")
+        found = _cache_lookup(key, allow_stale=False)
+        if found and not force:
+            return "skipped", f"{sport}:{league_id or 'all'}"
+        _compute_slate(sport, league_id, reuse=True)
+        return "ok", f"{sport}:{league_id or 'all'}"
+
+    # Leagues + NBA first (fixture work is shared with Todos). Two at a time
+    # so we stay inside typical API-Football Pro per-minute limits.
+    first = [(s, lid) for s, lid in _warm_targets() if s != "all"]
+    with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
+        futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in first}
+        for fut in as_completed(futs):
+            try:
+                kind, label = fut.result()
+                report[kind].append(label)
+            except Exception as exc:
+                s, lid = futs[fut]
+                report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
+    try:
+        kind, label = _one("all", None)
+        report[kind].append(label)
+    except Exception as exc:
+        report["errors"].append(f"all:{type(exc).__name__}")
+    return report
+
+
+def start_picks_background():
+    """Warm the slates on boot and refresh them on the 45-minute odds cadence."""
+    global _bg_started
+    with _bg_lock:
+        if _bg_started:
+            return
+        _bg_started = True
+
+    def _loop():
+        first = True
+        while True:
+            try:
+                warm_picks_cache(force=not first)
+            except Exception:
+                pass
+            first = False
+            time.sleep(SLATE_TTL)
+
+    threading.Thread(target=_loop, name="vip-picks-warm", daemon=True).start()

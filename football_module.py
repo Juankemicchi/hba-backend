@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from pathlib import Path
+import threading
 
 API_KEY = os.getenv("API_FOOTBALL_KEY", "")
 BASE_URL = "https://v3.football.api-sports.io"
@@ -16,6 +17,7 @@ CACHE_TTL_LIVE = 2 * 60 * 60     # fixtures, standings, lesions, H2H, stats
 CACHE_FILE = Path(os.getenv("FOOTBALL_CACHE_FILE", "/tmp/hba_football_cache.json"))
 
 _memory_cache = {}
+_cache_io_lock = threading.Lock()
 
 
 def _cache_key(path, params):
@@ -43,23 +45,25 @@ def _write_file_cache(store):
 
 def _cache_get(key):
     now = time.time()
-    entry = _memory_cache.get(key)
-    if entry and now - entry["ts"] < entry.get("ttl", CACHE_TTL_STABLE):
-        return entry["data"]
-    store = _read_file_cache()
-    entry = store.get(key)
-    if entry and now - entry["ts"] < entry.get("ttl", CACHE_TTL_STABLE):
-        _memory_cache[key] = entry
-        return entry["data"]
-    return None
+    with _cache_io_lock:
+        entry = _memory_cache.get(key)
+        if entry and now - entry["ts"] < entry.get("ttl", CACHE_TTL_STABLE):
+            return entry["data"]
+        store = _read_file_cache()
+        entry = store.get(key)
+        if entry and now - entry["ts"] < entry.get("ttl", CACHE_TTL_STABLE):
+            _memory_cache[key] = entry
+            return entry["data"]
+        return None
 
 
 def _cache_set(key, data, ttl):
     entry = {"ts": time.time(), "data": data, "ttl": ttl}
-    _memory_cache[key] = entry
-    store = _read_file_cache()
-    store[key] = entry
-    _write_file_cache(store)
+    with _cache_io_lock:
+        _memory_cache[key] = entry
+        store = _read_file_cache()
+        store[key] = entry
+        _write_file_cache(store)
 
 
 def _raise_api_errors(data):
