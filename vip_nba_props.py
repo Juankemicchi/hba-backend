@@ -386,6 +386,7 @@ def _build_player_candidates(player: dict, game: dict, venue: str, opponent: str
                 "h2h_games": len(h2h_vals),
                 "injury_status": (injury or {}).get("status") if injury and not _status_is_out((injury or {}).get("status")) else None,
                 "score": score,
+                "recent_values": list(recent_vals),
                 "note": " ".join(note_bits),
                 # Odds only if a real book source is attached later.
                 "avg_odd": None,
@@ -458,6 +459,8 @@ def _safe_url(url: Optional[str]) -> Optional[str]:
     except Exception:
         return None
     if not host or "." not in host:
+        return None
+    if not any(host == d or host.endswith("." + d) for d in BOOK_DOMAINS):
         return None
     return text
 
@@ -551,6 +554,93 @@ def _response_citations(resp) -> list[str]:
     return out
 
 
+
+MARKET_SYNONYMS = {
+    "PTS": {"PTS", "POINTS", "PUNTOS", "POINT", "PTS O/U"},
+    "REB": {"REB", "REBOUNDS", "REBOTES", "REBOUND"},
+    "AST": {"AST", "ASSISTS", "ASISTENCIAS", "ASSIST"},
+    "FG3M": {
+        "FG3M", "THREES", "THREES_MADE", "3PM", "3P", "3-PT", "3 PT",
+        "TRIPLES", "TRES", "THREE POINTERS", "THREE-POINTERS", "MADE THREES",
+        "3-POINTERS", "3 POINTERS", "TRES ANOTADOS",
+    },
+    "PRA": {"PRA", "PTS+REB+AST", "PUNTOS+REBOTES+ASISTENCIAS", "PTS + REB + AST"},
+    "PR": {"PR", "PTS+REB", "PUNTOS+REBOTES", "PTS + REB"},
+    "PA": {"PA", "PTS+AST", "PUNTOS+ASISTENCIAS", "PTS + AST"},
+    "RA": {"RA", "REB+AST", "REBOTES+ASISTENCIAS", "REB + AST"},
+}
+
+_BAD_URL_TOKENS = (
+    "first-basket", "first_basket", "first-scorer", "first_scorer",
+    "first-field-goal", "anytime-td", "anytime_touchdown", "anytime-touchdown",
+    "point-spread", "moneyline", "alt-spread",
+)
+
+_NBA_NICKS = {
+    "hawks", "celtics", "nets", "hornets", "bulls", "cavaliers", "cavs",
+    "mavericks", "mavs", "nuggets", "pistons", "warriors", "rockets",
+    "pacers", "clippers", "lakers", "grizzlies", "heat", "bucks",
+    "timberwolves", "wolves", "pelicans", "knicks", "thunder", "magic",
+    "76ers", "sixers", "suns", "blazers", "trailblazers", "kings", "spurs",
+    "raptors", "jazz", "wizards",
+}
+
+MAX_BOOK_LINE_GAP = 1.0
+
+
+def _norm_market_token(text: str) -> str:
+    return re.sub(r"[^A-Z0-9+]+", " ", (text or "").upper()).strip()
+
+
+def _markets_match(claimed: str, pick_market: str, pick_label: str) -> bool:
+    claimed_n = _norm_market_token(claimed)
+    if not claimed_n:
+        return False
+    key = (pick_market or "").upper()
+    aliases = set(MARKET_SYNONYMS.get(key, {key}))
+    aliases.add(key)
+    aliases.add(_norm_market_token(pick_label))
+    if claimed_n in aliases:
+        return True
+    # Allow "Tyrese Maxey Points" style labels that contain the alias.
+    return any(alias and alias in claimed_n for alias in aliases if len(alias) >= 3)
+
+
+def _url_path_ok(url: str, pick: dict) -> bool:
+    path = (urlparse(url).path or "").lower()
+    query = (urlparse(url).query or "").lower()
+    blob = path + " " + query
+    if any(tok in blob for tok in _BAD_URL_TOKENS):
+        return False
+    match = str(pick.get("match") or "")
+    parts = re.split(r"\s+vs\.?\s+", match, flags=re.I)
+    allowed = set()
+    for part in parts:
+        s = re.sub(r"[^a-z0-9 ]+", " ", (part or "").lower()).strip()
+        if "76ers" in s or "sixers" in s:
+            allowed.update({"76ers", "sixers"})
+        if "trail blazers" in s or "blazers" in s:
+            allowed.add("blazers")
+        if "timberwolves" in s:
+            allowed.update({"timberwolves", "wolves"})
+        last = s.split()[-1] if s.split() else ""
+        if last:
+            allowed.add(last)
+    norm = re.sub(r"[^a-z0-9]+", " ", blob)
+    found = {nick for nick in _NBA_NICKS if re.search(r"\b" + re.escape(nick) + r"\b", norm)}
+    # If the URL names an NBA team that is not in this game, it is the wrong matchup.
+    if found and allowed and (found - allowed):
+        return False
+    return True
+
+
+def _source_name_from_url(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
 def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
     """Optional one-shot Grok web search for real sportsbook lines.
 
@@ -610,6 +700,7 @@ def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
         return picks, meta
 
     applied = 0
+    rejected = 0
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -621,13 +712,13 @@ def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
             continue
         pick = picks[idx]
         player = str(row.get("player") or "").strip().lower()
-        if player and player not in str(pick.get("entity") or "").lower() and str(pick.get("entity") or "").lower() not in player:
+        entity = str(pick.get("entity") or "").lower()
+        if player and player not in entity and entity not in player:
             continue
-        market = str(row.get("market") or "").strip().upper()
-        if market and market not in {pick.get("market"), str(pick.get("market_label") or "").upper()}:
-            # allow soft market match on known keys only
-            if market not in PROP_LABELS and market not in {k.lower() for k in PROP_LABELS}:
-                continue
+        claimed_market = str(row.get("market") or row.get("market_label") or "").strip()
+        if not _markets_match(claimed_market or pick.get("market"), pick.get("market"), pick.get("market_label") or ""):
+            rejected += 1
+            continue
         try:
             book_line = float(str(row.get("line")).replace(",", "."))
         except (TypeError, ValueError):
@@ -637,34 +728,59 @@ def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
             continue
         source_url = _safe_url(row.get("source_url") or row.get("url"))
         if not source_url:
-            # A citation from the same domain as the claimed source can count.
-            source_name = str(row.get("source") or "").lower()
             for cit in citations:
-                host = (urlparse(cit).hostname or "").lower()
-                if source_name and source_name in host:
-                    source_url = cit
+                safe = _safe_url(cit)
+                if safe and _url_path_ok(safe, pick):
+                    source_url = safe
                     break
-        if not source_url:
+        if not source_url or not _url_path_ok(source_url, pick):
+            rejected += 1
             continue
+        estimated = pick.get("line_estimated") if pick.get("line_estimated") is not None else pick.get("line")
+        try:
+            gap = abs(float(book_line) - float(estimated))
+        except (TypeError, ValueError):
+            gap = 99
+        # A verified book line more than 1.0 away is a different bet (or a bad scrape).
+        if gap > MAX_BOOK_LINE_GAP + 0.01:
+            pick["book_conflict"] = True
+            pick["book_conflict_reason"] = "line_gap"
+            rejected += 1
+            continue
+        # Recompute the hit at the published book line. If it is no longer
+        # a 70%+ lean, do not feature the estimated (softer) line as a pick.
+        recent = pick.get("recent_values") or []
+        if recent and gap > 0.01:
+            hits_b, games_b, hit_b = _hit(recent, book_line, pick.get("selection") or "Under")
+            pick["hit_rate_at_book"] = hit_b
+            pick["hits_at_book"] = hits_b
+            pick["games_at_book"] = games_b
+            if games_b < 8 or hit_b < 70:
+                pick["book_conflict"] = True
+                pick["book_conflict_reason"] = "hit_at_book"
+                rejected += 1
+                continue
         odd_over = _parse_book_odd(row.get("odd_over") or row.get("over_odd"))
         odd_under = _parse_book_odd(row.get("odd_under") or row.get("under_odd"))
         side = pick.get("selection")
         real_odd = odd_over if side == "Over" else odd_under if side == "Under" else None
         pick["book_line"] = book_line
-        pick["book_source"] = (row.get("source") or urlparse(source_url).hostname or "").strip()
+        pick["book_source"] = _source_name_from_url(source_url)
         pick["book_source_url"] = source_url
         pick["book_line_label"] = "Línea en casas (vía Grok)"
+        # A single scraped odd is not a bookmaker consensus.
         if real_odd and real_odd >= 1.40:
             pick["avg_odd"] = real_odd
             pick["odd_min"] = real_odd
             pick["odd_max"] = real_odd
             pick["bookmakers"] = 1
-            pick["odds_verified"] = False  # single Grok-sourced odd, not a book consensus
+            pick["odds_verified"] = False
             pick["odds_source"] = "grok_web"
         applied += 1
     meta["ok"] = applied > 0
     meta["reason"] = "ok" if applied else "no_verified_source"
     meta["applied"] = applied
+    meta["rejected"] = rejected
     return picks, meta
 
 

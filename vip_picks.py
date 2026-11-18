@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.request
 import statistics
 import os
 import threading
@@ -26,6 +27,7 @@ from openai import OpenAI
 BOGOTA = ZoneInfo("America/Bogota")
 SLATE_TTL = 45 * 60
 MAX_FIXTURES = 6
+NBA_MAX_FIXTURES = 12
 LAST_N = 8
 CACHE_FILE = Path(os.getenv("VIP_PICKS_CACHE_FILE", "/tmp/hba_vip_picks_cache.json"))
 
@@ -56,12 +58,34 @@ def _today() -> str:
     return datetime.now(BOGOTA).date().isoformat()
 
 
-def _parse_kickoff(iso_str: Optional[str]) -> Optional[datetime]:
-    if not iso_str:
+def _parse_kickoff(iso_str) -> Optional[datetime]:
+    """Parse a kickoff into America/Bogota. Date-only strings are rejected.
+
+    Already-formatted Bogota labels (YYYY-MM-DD HH:MM) stay in Bogota, not UTC.
+    """
+    if iso_str is None or iso_str == "":
+        return None
+    if isinstance(iso_str, (int, float)) or (
+        isinstance(iso_str, str) and re.fullmatch(r"\d{10,13}", iso_str.strip())
+    ):
+        try:
+            ts = float(iso_str)
+            if ts > 1e12:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=ZoneInfo("UTC")).astimezone(BOGOTA)
+        except (TypeError, ValueError, OSError):
+            return None
+    raw = str(iso_str).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", raw):
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=BOGOTA)
+        except ValueError:
+            return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
         return None
     try:
-        raw = iso_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(raw)
+        raw2 = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw2)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(BOGOTA)
@@ -69,9 +93,9 @@ def _parse_kickoff(iso_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _kickoff_label(iso_str: Optional[str]) -> Optional[str]:
+def _kickoff_label(iso_str) -> Optional[str]:
     dt = _parse_kickoff(iso_str)
-    return dt.strftime("%Y-%m-%d %H:%M") if dt else iso_str
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else None
 
 
 def list_vip_competitions() -> dict:
@@ -88,7 +112,7 @@ def list_vip_competitions() -> dict:
 
 
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
-    return f"v4|{date_str}|{sport}|{league_id or 'all'}|{window}"
+    return f"v5|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
 def _cache_get(key: str):
@@ -367,23 +391,37 @@ def _collect_football_fixtures(league_id: Optional[int], dates_bogota: list[str]
     return fixtures
 
 
+_FINISHED_STATUS = {
+    "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO",
+    "POSTPONED", "CANCELLED", "CANCELED", "CANCELED", "FINAL", "POST",
+}
+_LIVE_STATUS = {
+    "1H", "2H", "HT", "ET", "P", "BT", "LIVE", "INPLAY", "IN_PROGRESS",
+    "Q1", "Q2", "Q3", "Q4", "OT", "BT",
+}
+
+
 def _upcoming_only(fixtures: list[dict]) -> list[dict]:
     keep = []
+    now = datetime.now(BOGOTA)
     for fx in fixtures:
         status = (fx.get("status") or "").upper()
-        if status in {"FT", "AET", "PEN"}:
+        if status in _FINISHED_STATUS:
+            continue
+        dt = _parse_kickoff(fx.get("kickoff") or fx.get("date"))
+        if dt and dt < now - timedelta(hours=2) and status not in _LIVE_STATUS:
             continue
         keep.append(fx)
     return keep
 
 
-def _trim_fixtures(fixtures: list[dict]) -> list[dict]:
+def _trim_fixtures(fixtures: list[dict], limit: Optional[int] = None) -> list[dict]:
     def sort_key(fx):
         dt = _parse_kickoff(fx.get("kickoff") or fx.get("date"))
         return dt or datetime.max.replace(tzinfo=BOGOTA)
 
     fixtures = sorted(fixtures, key=sort_key)
-    return fixtures[:MAX_FIXTURES]
+    return fixtures[:(limit or MAX_FIXTURES)]
 
 
 def _market_from_props(analysis: dict, key: str) -> Optional[dict]:
@@ -675,7 +713,7 @@ MATCH_MARKETS = {
 # Team-specific markets must name the team in the label.
 TEAM_MARKETS_VIP = {
     "corners_for": {"label": "córners a favor", "min_line": 3.5, "row_key": "corners_for", "bet_home": ODDS_CORNERS_HOME, "bet_away": ODDS_CORNERS_AWAY},
-    "goals_for": {"label": "goles anotados", "min_line": 0.5, "row_key": "goals_for", "bet_home": ODDS_GOALS_HOME, "bet_away": ODDS_GOALS_AWAY},
+    "goals_for": {"label": "goles anotados", "min_line": 1.5, "row_key": "goals_for", "bet_home": ODDS_GOALS_HOME, "bet_away": ODDS_GOALS_AWAY},
     "cards": {"label": "tarjetas", "min_line": 1.5, "row_key": "cards", "bet_home": ODDS_CARDS_HOME, "bet_away": ODDS_CARDS_AWAY},
 }
 
@@ -970,6 +1008,7 @@ def _build_ou_candidate(fx, values, line, side, market, label, entity, entity_id
         logo=logo,
         note=note,
         avg=round(sum(values) / len(values), 2) if values else None,
+        sample_values=list(values),
     )
     return _attach_odds(cand, odds_info)
 
@@ -1163,10 +1202,31 @@ def _nba_games_on_date(date_str: str) -> list[dict]:
             "away": away_name,
             "home_id": home.get("id") or row.get("home_id") or row.get("home_team_id"),
             "away_id": away.get("id") or row.get("away_id") or row.get("away_team_id"),
-            "kickoff": row.get("start_time") or row.get("date") or row.get("datetime") or row.get("tipoff"),
+            "kickoff": _nba_raw_kickoff(row),
             "league": "NBA",
+            "status": row.get("status") or row.get("state"),
         })
-    return games
+    return _fill_nba_kickoffs(games, date_str)
+
+
+def _nba_raw_kickoff(row: dict):
+    for key in (
+        "kickoff_utc", "start_time_utc", "tipoff_utc", "commence_time",
+        "scheduled_at", "datetime_utc", "starts_at", "startDate", "start_at",
+        "start_time", "tipoff", "tip_off", "datetime", "date_time", "game_time",
+        "kickoff", "date",
+    ):
+        val = row.get(key)
+        if val in (None, ""):
+            continue
+        # Date-only is not a tip time; keep looking.
+        if isinstance(val, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", val.strip()):
+            continue
+        if _parse_kickoff(val):
+            return val
+        if val:
+            return val
+    return None
 
 
 def _nba_team_recent(team_id) -> list[dict]:
@@ -1284,11 +1344,19 @@ def _nba_team_candidates(team_name, team_id, fixture: dict) -> list[dict]:
     return out
 
 
-def _rank_nba_props(candidates: list[dict], limit: int = 5) -> list[dict]:
+def _nba_prop_sort_key(cand: dict) -> tuple:
+    score = float(cand.get("score") or 0)
+    # A 0.5 threes under without a sourced book line is a thin, often juiced lean.
+    if cand.get("market") == "FG3M" and (cand.get("line") or 0) <= 0.5 and cand.get("book_line") is None:
+        score -= 20
+    return (-score, -(cand.get("hit_rate") or 0), -(cand.get("games") or 0))
+
+
+def _rank_nba_props(candidates: list[dict], limit: int = 5, keep_score: bool = False) -> list[dict]:
     seen_player = set()
     per_game: dict = {}
     ranked = []
-    for cand in sorted(candidates, key=lambda c: (-(c.get("score") or 0), -(c.get("hit_rate") or 0), -(c.get("games") or 0))):
+    for cand in sorted(candidates, key=_nba_prop_sort_key):
         pid = cand.get("entity_id") or cand.get("entity")
         if pid in seen_player:
             continue
@@ -1302,7 +1370,8 @@ def _rank_nba_props(candidates: list[dict], limit: int = 5) -> list[dict]:
             break
     for i, pick in enumerate(ranked, start=1):
         pick["rank"] = i
-        pick.pop("score", None)
+        if not keep_score:
+            pick.pop("score", None)
     return ranked
 
 
@@ -1328,6 +1397,137 @@ def _rank_top(candidates: list[dict], limit: int = 5) -> list[dict]:
         pick["rank"] = i
         pick.pop("score", None)
     return ranked
+
+
+
+def _sample_recent_hits(pick: dict) -> bool:
+    """Most recent sample point(s) must have hit. Match totals check both teams' latest."""
+    values = pick.get("sample_values") or pick.get("recent_values") or []
+    line = pick.get("line")
+    side = pick.get("selection")
+    if not values or line is None or side not in {"Over", "Under"}:
+        return False
+
+    def _ok(val) -> bool:
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return False
+        return v <= float(line) if side == "Under" else v > float(line)
+
+    idxs = [0]
+    if pick.get("entity_side") == "match" and len(values) >= 10:
+        idxs.append(len(values) // 2)
+    return all(_ok(values[i]) for i in idxs if i < len(values))
+
+
+def _is_maxima_confianza(pick: dict) -> bool:
+    """Strict badge for real-money use. Never awarded to 1X2 form or unsourced NBA estimates."""
+    if (pick.get("sport") or "football") != "football":
+        return False
+    market = (pick.get("market") or "").lower()
+    bet_name = (pick.get("bet_name") or "").lower()
+    if market in {"1x2", "moneyline"} or bet_name in {"match winner"} or pick.get("bet_id") == 1:
+        return False
+    if not pick.get("odds_verified"):
+        return False
+    try:
+        hit = float(pick.get("hit_rate") or 0)
+        games = int(pick.get("games") or 0)
+        books = int(pick.get("bookmakers") or 0)
+        odd = float(pick.get("avg_odd") or 0)
+        edge = float(pick.get("edge") or 0)
+    except (TypeError, ValueError):
+        return False
+    if hit < 80 or games < 8 or books < 3 or odd < 1.40 or edge <= 0:
+        return False
+    if not _sample_recent_hits(pick):
+        return False
+    return True
+
+
+def _apply_maxima_confianza(picks: list[dict]) -> list[dict]:
+    for pick in picks:
+        pick["maxima_confianza"] = _is_maxima_confianza(pick)
+        pick.pop("sample_values", None)
+        pick.pop("recent_values", None)
+    return picks
+
+
+def _nba_team_nick(name: str) -> str:
+    s = re.sub(r"[^a-z0-9 ]+", " ", (name or "").lower()).strip()
+    special = {
+        "trail blazers": "blazers",
+        "trailblazers": "blazers",
+        "76ers": "76ers",
+        "sixers": "76ers",
+        "timberwolves": "timberwolves",
+    }
+    for key, nick in special.items():
+        if key in s:
+            return nick
+    parts = s.split()
+    return parts[-1] if parts else s
+
+
+def _espn_nba_tipoffs(date_str: str) -> list[dict]:
+    """Public ESPN scoreboard times for a Bogota calendar date. Fail soft."""
+    try:
+        ymd = date_str.replace("-", "")
+        url = (
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
+            f"scoreboard?dates={ymd}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "HBA-VIP-picks/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return []
+    out = []
+    for ev in data.get("events") or []:
+        comps = ev.get("competitions") or []
+        if not comps:
+            continue
+        comp = comps[0]
+        status = ((comp.get("status") or {}).get("type") or {}).get("description") or ""
+        if str(status).lower() in {"final", "postponed", "canceled", "cancelled"}:
+            continue
+        home = away = None
+        for team in comp.get("competitors") or []:
+            nm = (team.get("team") or {}).get("displayName")
+            if team.get("homeAway") == "home":
+                home = nm
+            else:
+                away = nm
+        kickoff = comp.get("date") or ev.get("date")
+        if home and away and kickoff:
+            out.append({"home": home, "away": away, "kickoff": kickoff, "status": status})
+    return out
+
+
+def _fill_nba_kickoffs(games: list[dict], date_str: str) -> list[dict]:
+    missing = [g for g in games if not _parse_kickoff(g.get("kickoff"))]
+    if not missing:
+        return games
+    board = _espn_nba_tipoffs(date_str)
+    if not board:
+        return games
+    used = set()
+    for game in games:
+        if _parse_kickoff(game.get("kickoff")):
+            continue
+        g_home = _nba_team_nick(game.get("home") or "")
+        g_away = _nba_team_nick(game.get("away") or "")
+        for i, ev in enumerate(board):
+            if i in used:
+                continue
+            if _nba_team_nick(ev["home"]) == g_home and _nba_team_nick(ev["away"]) == g_away:
+                game["kickoff"] = ev["kickoff"]
+                if ev.get("status") and not game.get("status"):
+                    game["status"] = ev["status"]
+                used.add(i)
+                break
+    return games
 
 
 def _public_fixtures(fixtures: list[dict], sport: str) -> list[dict]:
@@ -1365,6 +1565,7 @@ def _build_football(league_id: Optional[int]) -> dict:
     ai = bool(os.getenv("XAI_API_KEY"))
     if picks:
         picks = _explain_with_grok(picks)
+    picks = _apply_maxima_confianza(picks)
     return {
         "date": today,
         "window": window,
@@ -1400,15 +1601,17 @@ def _build_nba() -> dict:
         games = _nba_games_on_date(tomorrow)
         if games:
             window = "upcoming"
-    games = _trim_fixtures(games)
+    games = _trim_fixtures(games, NBA_MAX_FIXTURES)
     # Player props are the NBA daily product. Team totals remain a fallback only.
     candidates = nprops.collect_nba_prop_candidates(games)
-    picks = _rank_nba_props(candidates, 5)
+    pool = _rank_nba_props(candidates, 12, keep_score=True)
+    grok_lines = {"attempted": False, "ok": False, "reason": "no_picks"}
+    if pool:
+        pool, grok_lines = nprops.enrich_props_with_grok_lines(pool)
+        pool = [p for p in pool if not p.get("book_conflict")]
+    picks = _rank_nba_props(pool, 5)
     for pick in picks:
         pick["kickoff"] = _kickoff_label(pick.get("kickoff"))
-    grok_lines = {"attempted": False, "ok": False, "reason": "no_picks"}
-    if picks:
-        picks, grok_lines = nprops.enrich_props_with_grok_lines(picks)
     if len(picks) < 5:
         fallback = []
         for game in games:
@@ -1426,6 +1629,7 @@ def _build_nba() -> dict:
     ai = bool(os.getenv("XAI_API_KEY"))
     if picks:
         picks = _explain_with_grok(picks)
+    picks = _apply_maxima_confianza(picks)
     empty = None
     if not games:
         empty = "No hay partidos NBA programados hoy ni mañana."
