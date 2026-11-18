@@ -828,7 +828,7 @@ def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
         pick["book_line"] = book_line
         pick["book_source"] = _source_name_from_url(source_url)
         pick["book_source_url"] = source_url
-        pick["book_line_label"] = "Línea en casas (vía Grok)"
+        pick["book_line_label"] = "Línea en casas"
         # A single scraped odd is not a bookmaker consensus.
         if real_odd and real_odd >= 1.40:
             pick["avg_odd"] = real_odd
@@ -836,7 +836,7 @@ def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
             pick["odd_max"] = real_odd
             pick["bookmakers"] = 1
             pick["odds_verified"] = False
-            pick["odds_source"] = "grok_web"
+            pick["odds_source"] = "web"
         applied += 1
     meta["ok"] = applied > 0
     meta["reason"] = "ok" if applied else "no_verified_source"
@@ -876,8 +876,7 @@ def statistical_reason(pick: dict) -> str:
     if pick.get("hit_rate_season") is not None:
         text += f" En la muestra de temporada el acierto fue {pick['hit_rate_season']}%."
     if pick.get("book_line") is not None:
-        src = pick.get("book_source") or "fuente web"
-        text += f" Línea en casas (vía Grok): {pick['book_line']} ({src})."
+        text += f" Línea en casas: {pick['book_line']}."
         if pick.get("avg_odd") is not None:
             text += f" Cuota reportada {pick['avg_odd']}."
     return text

@@ -76,7 +76,7 @@ def _parse_json_array(text: str) -> list:
 def vision_extract(image_base64: str, mime: str = "image/jpeg") -> list[dict]:
     key = _xai_key()
     if not key:
-        raise RuntimeError("XAI_API_KEY no está configurada; la lectura de capturas requiere Grok visión.")
+        raise RuntimeError("La lectura de capturas no está disponible en este momento.")
     url = "https://api.x.ai/v1/responses"
     payload = {
         "model": "grok-4.7",
@@ -97,7 +97,7 @@ def vision_extract(image_base64: str, mime: str = "image/jpeg") -> list[dict]:
         timeout=90,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"Grok visión no disponible ({resp.status_code})")
+        raise RuntimeError("No se pudo leer la captura. Inténtalo de nuevo.")
     body = resp.json()
     text = ""
     if isinstance(body.get("output_text"), str):
@@ -500,7 +500,7 @@ def analyze_slip(req: SlipRequest) -> dict:
             "error": errors[0] if errors else "No se pudieron leer selecciones. Escribe tus picks o sube una captura.",
             "picks": [],
             "parlay": None,
-            "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad.",
+            "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
         }
 
     picks = []
@@ -554,5 +554,5 @@ def analyze_slip(req: SlipRequest) -> dict:
         "errors": errors,
         "picks": picks,
         "parlay": parlay,
-        "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad. El porcentaje combinado es solo una estimación.",
+        "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
     }

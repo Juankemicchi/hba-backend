@@ -282,7 +282,6 @@ def _explain_with_grok(picks: list[dict]) -> list[dict]:
             "line_estimated": pick.get("line_estimated"),
             "line_label": pick.get("line_label"),
             "book_line": pick.get("book_line"),
-            "book_source": pick.get("book_source"),
             "hit_rate_season": pick.get("hit_rate_season"),
         })
     prompt = (
@@ -290,8 +289,8 @@ def _explain_with_grok(picks: list[dict]) -> list[dict]:
         "en el mismo orden. Usa EXCLUSIVAMENTE los números dados. "
         "Si el pick es un prop NBA: menciona el promedio reciente, la mediana, el hit rate "
         "y deja claro que la línea es una LÍNEA ESTIMADA de HBA, no una cuota de casa, "
-        "salvo que venga book_line/book_source, en cuyo caso cita esa 'línea en casas (vía Grok)' "
-        "y su fuente. No presentes una estimación como cuota real. "
+        "salvo que venga book_line, en cuyo caso cita esa 'línea en casas' sin nombrar fuentes ni proveedores. "
+        "No presentes una estimación como cuota real. No menciones Grok, APIs, ESPN ni URLs. "
         "Si el pick es de fútbol: menciona la cuota promedio y el edge conservador. "
         "No inventes estadísticas, lesiones, cuotas ni noticias. No des consejos de apuesta. "
         "Devuelve un JSON array de strings, nada más.\n\n"
@@ -1606,7 +1605,7 @@ def _build_football(league_id: Optional[int]) -> dict:
         "picks": picks,
         "ai_explained": bool(ai and picks),
         "empty_reason": None if fixtures else "No hay partidos programados hoy ni mañana en las competiciones seleccionadas.",
-        "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad. Las razones describen únicamente las cifras calculadas por HBA.",
+        "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
     }
 
 
@@ -1622,8 +1621,8 @@ def _build_nba() -> dict:
             "fixtures": [],
             "picks": [],
             "ai_explained": False,
-            "empty_reason": "NBA no disponible: falta BIGBALLS_API_KEY en este entorno.",
-            "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad.",
+            "empty_reason": "NBA no disponible en este entorno.",
+            "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
         }
     # BigBalls (and many NBA feeds) date games in UTC, so a 19:00 Bogotá
     # tipoff lives on the next UTC date. Query today+tomorrow and keep the
@@ -1680,8 +1679,7 @@ def _build_nba() -> dict:
         "picks": picks,
         "ai_explained": bool(ai and picks),
         "empty_reason": empty,
-        "grok_lines": grok_lines,
-        "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad. Las líneas NBA marcadas como estimadas no son cuotas de casas de apuestas.",
+        "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
     }
 
 

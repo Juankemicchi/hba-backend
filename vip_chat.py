@@ -23,7 +23,7 @@ SYSTEM = (
     "Nunca inventes hit rates, promedios, alineaciones, cuotas ni resultados. "
     "Si una herramienta falla o no hay muestra suficiente, dilo con claridad. "
     "Cuando hables de un mercado, incluye hit rate, hits/juegos y la línea usada. "
-    "Esto es análisis estadístico, no un consejo de apuesta. Recuerda el juego responsable (18+)."
+    "Cierra recordando solo esto si hace falta: +18. Apuesta bajo tu propia responsabilidad. No menciones proveedores, APIs ni fuentes."
 )
 
 TOOLS = [
@@ -134,7 +134,7 @@ class ChatRequest(BaseModel):
 def _client() -> OpenAI:
     key = os.getenv("XAI_API_KEY")
     if not key:
-        raise RuntimeError("XAI_API_KEY no está configurada en este entorno.")
+        raise RuntimeError("El chat no está disponible en este momento.")
     return OpenAI(api_key=key, base_url="https://api.x.ai/v1")
 
 
@@ -258,7 +258,7 @@ def vip_chat(req: ChatRequest) -> dict:
     if not os.getenv("XAI_API_KEY"):
         return {
             "ok": False,
-            "error": "El chat VIP necesita XAI_API_KEY en el servidor. Configúrala en Render para activar Grok.",
+            "error": "El chat no está disponible en este momento. Inténtalo más tarde.",
             "message": None,
         }
     history = []
@@ -294,7 +294,7 @@ def vip_chat(req: ChatRequest) -> dict:
                     "ok": True,
                     "message": text,
                     "used_tools": used_tools,
-                    "disclaimer": "Análisis estadístico, no es un consejo de apuesta. 18+. Juega con responsabilidad.",
+                    "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
                 }
             messages.append({
                 "role": "assistant",
