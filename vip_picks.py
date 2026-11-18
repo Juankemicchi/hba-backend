@@ -112,7 +112,7 @@ def list_vip_competitions() -> dict:
 
 
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
-    return f"v5|{date_str}|{sport}|{league_id or 'all'}|{window}"
+    return f"v6|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
 def _cache_get(key: str):

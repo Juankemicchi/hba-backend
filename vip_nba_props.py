@@ -13,6 +13,7 @@ import re
 import statistics
 from datetime import datetime
 from typing import Optional
+import urllib.request
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -170,8 +171,56 @@ def _status_is_out(status: Optional[str]) -> bool:
     return any(tag in low for tag in ("out", "inactive", "suspended", "indefinitely"))
 
 
+def _norm_player_name(name: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    text = re.sub(r"\b(jr|sr|iii|ii|iv)\b", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_espn_injuries() -> dict[str, dict]:
+    """Public ESPN NBA injury report. Best-effort; never fatal."""
+    index: dict[str, dict] = {}
+    try:
+        req = urllib.request.Request(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries",
+            headers={"User-Agent": "HBA-VIP-picks/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return index
+    for team in data.get("injuries") or []:
+        if not isinstance(team, dict):
+            continue
+        team_name = team.get("displayName")
+        for row in team.get("injuries") or []:
+            if not isinstance(row, dict):
+                continue
+            ath = row.get("athlete") or {}
+            name = (ath.get("displayName") if isinstance(ath, dict) else None) or row.get("displayName") or ""
+            name = str(name).strip()
+            if not name:
+                continue
+            rec = {
+                "status": row.get("status"),
+                "comment": row.get("shortComment") or row.get("longComment"),
+                "name": name,
+                "team": team_name,
+                "source": "espn",
+            }
+            index[f"name:{name.lower()}"] = rec
+            norm = _norm_player_name(name)
+            if norm:
+                index[f"name:{norm}"] = rec
+    return index
+
+
 def fetch_injuries() -> dict[str, dict]:
-    """Map player id (and name) to the latest injury row. Best-effort; never fatal."""
+    """Map player id (and name) to the latest injury row. Best-effort; never fatal.
+
+    BigBalls is the first source; the public ESPN report fills gaps so a
+    confirmed Out player is not recommended.
+    """
     index: dict[str, dict] = {}
     try:
         data = nba.api_get(
@@ -179,29 +228,36 @@ def fetch_injuries() -> dict[str, dict]:
             {"sport": "basketball", "league": "nba", "limit": 200},
             ttl=nba.CACHE_TTL_LIVE,
         )
+        payload = data.get("data") if isinstance(data, dict) else data
+        rows = []
+        if isinstance(payload, dict):
+            rows = payload.get("injuries") or payload.get("data") or payload.get("results") or []
+        elif isinstance(payload, list):
+            rows = payload
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            player = item.get("player") if isinstance(item.get("player"), dict) else {}
+            pid = str(player.get("id") or item.get("player_id") or "")
+            name = (player.get("name") or item.get("player_name") or item.get("name") or "").strip()
+            rec = {
+                "status": item.get("status") or item.get("designation") or item.get("injury_status"),
+                "comment": item.get("comment") or item.get("note") or item.get("description"),
+                "name": name,
+            }
+            if pid:
+                index[pid] = rec
+            if name:
+                index[f"name:{name.lower()}"] = rec
+                norm = _norm_player_name(name)
+                if norm:
+                    index[f"name:{norm}"] = rec
     except Exception:
-        return index
-    payload = data.get("data") if isinstance(data, dict) else data
-    rows = []
-    if isinstance(payload, dict):
-        rows = payload.get("injuries") or payload.get("data") or payload.get("results") or []
-    elif isinstance(payload, list):
-        rows = payload
-    for item in rows or []:
-        if not isinstance(item, dict):
-            continue
-        player = item.get("player") if isinstance(item.get("player"), dict) else {}
-        pid = str(player.get("id") or item.get("player_id") or "")
-        name = (player.get("name") or item.get("player_name") or item.get("name") or "").strip()
-        rec = {
-            "status": item.get("status") or item.get("designation") or item.get("injury_status"),
-            "comment": item.get("comment") or item.get("note") or item.get("description"),
-            "name": name,
-        }
-        if pid:
-            index[pid] = rec
-        if name:
-            index[f"name:{name.lower()}"] = rec
+        pass
+    for key, rec in fetch_espn_injuries().items():
+        prev = index.get(key)
+        if not prev or (_status_is_out(rec.get("status")) and not _status_is_out(prev.get("status"))):
+            index[key] = rec
     return index
 
 
@@ -423,7 +479,12 @@ def collect_nba_prop_candidates(games: list[dict]) -> list[dict]:
                 if pid in seen_players:
                     continue
                 seen_players.add(pid)
-                injury = injuries.get(pid) or injuries.get(f"name:{(player.get('name') or '').lower()}")
+                pname = player.get("name") or ""
+                injury = (
+                    injuries.get(pid)
+                    or injuries.get(f"name:{pname.lower()}")
+                    or injuries.get(f"name:{_norm_player_name(pname)}")
+                )
                 try:
                     candidates.extend(_build_player_candidates(player, game, venue, opponent or "", injury))
                 except Exception:
