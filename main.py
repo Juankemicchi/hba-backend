@@ -1,6 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from nba_module import analyze_prop
+from nba_module import (
+    analyze_prop,
+    search_nba,
+    list_nba_teams,
+    get_nba_roster,
+    analyze_nba_player,
+    NBA_LABELS,
+)
 from football_module import (
     get_team_stats,
     get_h2h,
@@ -363,6 +370,12 @@ def football_squad(team: int):
 def _fmt_market(m):
     if not m or not m.get("games"):
         return "sin datos"
+    if m.get("kind") == "yesno":
+        side = "Sí" if (m.get("side") or m.get("line")) == "yes" else "No"
+        return (
+            f"{m.get('label')}: Sí en {m.get('yes_rate')}% ({m.get('hits') if (m.get('side') or m.get('line'))=='yes' else (m.get('games') or 0) - (m.get('hits') or 0)}/{m.get('games')}), "
+            f"No en {m.get('no_rate')}%. Mercado elegido: {side}, hit rate {m.get('hit_rate')}% ({m.get('hits')}/{m.get('games')})"
+        )
     return f"{m.get('label')}: promedio {m.get('avg')} vs línea {m.get('line')}, hit rate {m.get('hit_rate')}% ({m.get('hits')}/{m.get('games')})"
 
 
@@ -390,6 +403,9 @@ def generate_props_analysis(kind: str, name: str, ctx: dict, market_key: str = N
             for m in (ctx.get("h2h") or [])[:5]:
                 h2h_lines.append(f"- {(m.get('date') or '')[:10]} {m.get('home')} {m.get('goals_home')}-{m.get('goals_away')} {m.get('away')}")
             extra += "\nH2H reciente:\n" + "\n".join(h2h_lines)
+    elif kind == "nba":
+        team = (ctx.get("team") or {}).get("name") or ""
+        extra = f"Equipo NBA: {team}. Partidos analizados: {ctx.get('played')}."
     else:
         team = (ctx.get("team") or {}).get("name") or ""
         extra = f"Equipo: {team}. Partidos con minutos: {ctx.get('played')}. Portero: {ctx.get('is_goalkeeper')}."
@@ -404,15 +420,15 @@ Temporada: {ctx.get('season')}  Últimos partidos: {ctx.get('last_n')}
 Mercados:
 {markets_txt}
 
-Detalle del mercado principal ({MARKET_LABELS.get(primary, primary)}):
+Detalle del mercado principal ({(stats.get(primary) or {}).get('label') or MARKET_LABELS.get(primary) or NBA_LABELS.get(primary, primary)}):
 {recent or 'sin serie'}
 
 {rec_txt}
 
 Cierra con estas dos líneas exactas al final:
-RECOMENDACIÓN: OVER|UNDER|NEUTRAL <línea> <mercado>
+RECOMENDACIÓN: OVER|UNDER|SÍ|NO|NEUTRAL <línea> <mercado>
 CONFIANZA: <1-5>/5
-Sé directo. Menciona consistencia, riesgo y si el promedio sostiene la línea."""
+Sé directo. Menciona consistencia, riesgo y si el promedio sostiene la línea. Si el mercado es Ambos anotan, usa SÍ o NO (no over/under)."""
 
     try:
         response = client.chat.completions.create(
@@ -489,6 +505,70 @@ def football_analyze_player(request: PlayerPropsRequest):
             data["ai_analysis"] = generate_props_analysis("player", name, data, request.market)
         elif not data.get("matches"):
             data["ai_analysis"] = data.get("error") or "No hay partidos recientes con minutos para este jugador."
+        else:
+            data["ai_analysis"] = None
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class NbaPlayerPropsRequest(BaseModel):
+    player: Optional[str] = None
+    player_id: Optional[str] = None
+    last_n: int = 10
+    lines: Optional[dict] = None
+    market: Optional[str] = None
+    include_ai: bool = True
+
+
+@app.get("/api/nba/search")
+def nba_search(q: str = "", query: str = ""):
+    try:
+        return search_nba((q or query or "").strip())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/nba/teams")
+def nba_teams():
+    try:
+        return {"teams": list_nba_teams()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/nba/roster")
+def nba_roster(team_id: str = "", team: str = ""):
+    try:
+        tid = (team_id or team or "").strip()
+        if not tid:
+            raise HTTPException(status_code=422, detail="Indica un equipo")
+        data = get_nba_roster(tid)
+        if not data.get("players"):
+            raise HTTPException(status_code=404, detail="No se encontró la plantilla")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/nba/analyze/player")
+def nba_analyze_player(request: NbaPlayerPropsRequest):
+    try:
+        if not request.player and not request.player_id:
+            raise HTTPException(status_code=422, detail="Indica un jugador")
+        data = analyze_nba_player(
+            player=request.player,
+            player_id=request.player_id,
+            last_n=request.last_n,
+            lines=request.lines,
+            market=request.market,
+        )
+        name = (data.get("player") or {}).get("name") or request.player
+        if request.include_ai and data.get("matches"):
+            data["ai_analysis"] = generate_props_analysis("nba", name, data, request.market)
         else:
             data["ai_analysis"] = None
         return data

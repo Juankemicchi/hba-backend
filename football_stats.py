@@ -14,7 +14,7 @@ TEAM_MARKETS = [
     ("yellow", "Tarjetas amarillas", 1.5),
     ("red", "Tarjetas rojas", 0.5),
     ("cards", "Tarjetas (total)", 2.5),
-    ("btts", "Ambos anotan", 0.5),
+    ("btts", "Ambos anotan", "yes"),
     ("saves", "Atajadas", 3.5),
     ("offsides", "Offsides", 1.5),
 ]
@@ -51,6 +51,80 @@ def _clamp_last_n(last_n):
     except (TypeError, ValueError):
         n = 10
     return max(5, min(15, n))
+
+
+def snap_half(value, default=0.5):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.5, round(number - 0.5) + 0.5)
+
+
+def _yes_side(value, default="yes"):
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("no", "n", "0", "false", "under"):
+        return "no"
+    if text in ("yes", "si", "sí", "s", "1", "true", "over"):
+        return "yes"
+    return default
+
+
+def summarize_btts(rows, side="yes"):
+    side = _yes_side(side, "yes")
+    values = []
+    for row in rows:
+        if "btts" not in row or row["btts"] is None:
+            continue
+        happened = 1 if row["btts"] else 0
+        hit = happened == 1 if side == "yes" else happened == 0
+        values.append({
+            "date": row.get("date"),
+            "opponent": row.get("opponent"),
+            "venue": row.get("venue"),
+            "value": happened,
+            "display": "Sí" if happened else "No",
+            "line": side,
+            "over": hit,
+            "fixture_id": row.get("fixture_id"),
+            "result": row.get("result"),
+            "score": row.get("score"),
+        })
+    games = len(values)
+    if not games:
+        return {
+            "avg": None,
+            "hit_rate": None,
+            "hits": 0,
+            "games": 0,
+            "line": side,
+            "side": side,
+            "kind": "yesno",
+            "yes_rate": None,
+            "no_rate": None,
+            "key": "btts",
+            "label": MARKET_LABELS.get("btts", "Ambos anotan"),
+            "values": [],
+        }
+    yes_hits = sum(1 for item in values if item["value"] == 1)
+    hits = sum(1 for item in values if item["over"])
+    yes_rate = round(yes_hits * 100 / games, 1)
+    return {
+        "avg": round(yes_hits / games, 2),
+        "hit_rate": round(hits * 100 / games, 1),
+        "hits": hits,
+        "games": games,
+        "line": side,
+        "side": side,
+        "kind": "yesno",
+        "yes_rate": yes_rate,
+        "no_rate": round(100 - yes_rate, 1),
+        "key": "btts",
+        "label": MARKET_LABELS.get("btts", "Ambos anotan"),
+        "values": values,
+    }
 
 
 def summarize_series(rows, key, line):
@@ -104,7 +178,18 @@ def recommend(market):
     games = market["games"]
     avg = market["avg"]
     line = market["line"]
-    if hit >= 65 and avg is not None and avg > line:
+    if market.get("kind") == "yesno":
+        yes_rate = market.get("yes_rate")
+        if yes_rate is None and games:
+            yes_rate = round(sum(1 for v in market.get("values") or [] if v.get("value") == 1) * 100 / games, 1)
+        if yes_rate is not None and yes_rate >= 65:
+            lean = "SI"
+        elif yes_rate is not None and yes_rate <= 35:
+            lean = "NO"
+        else:
+            lean = "NEUTRAL"
+        line = market.get("side") or line
+    elif hit >= 65 and avg is not None and avg > line:
         lean = "OVER"
     elif hit <= 35 and avg is not None and avg < line:
         lean = "UNDER"
@@ -369,14 +454,20 @@ def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="a
     merged_lines = dict(DEFAULT_LINES_TEAM)
     if isinstance(lines, dict):
         for k, v in lines.items():
-            try:
-                merged_lines[k] = float(v)
-            except (TypeError, ValueError):
-                pass
+            if k == "btts":
+                merged_lines[k] = _yes_side(v, "yes")
+            else:
+                try:
+                    merged_lines[k] = snap_half(v, DEFAULT_LINES_TEAM.get(k, 0.5))
+                except (TypeError, ValueError):
+                    pass
 
     stats = {}
     for key, _label, default in TEAM_MARKETS:
-        stats[key] = summarize_series(rows, key, merged_lines.get(key, default))
+        if key == "btts":
+            stats[key] = summarize_btts(rows, merged_lines.get(key, default))
+        else:
+            stats[key] = summarize_series(rows, key, merged_lines.get(key, default))
 
     primary = market if market in stats else "corners_total"
     if stats.get(primary, {}).get("games") in (0, None):
@@ -723,7 +814,7 @@ def analyze_player_props(player=None, player_id=None, team=None, team_id=None, l
     if isinstance(lines, dict):
         for k, v in lines.items():
             try:
-                merged_lines[k] = float(v)
+                merged_lines[k] = snap_half(v, DEFAULT_LINES_PLAYER.get(k, 0.5))
             except (TypeError, ValueError):
                 pass
 
