@@ -229,13 +229,14 @@ def _stat_maps(response, team_id):
 
 
 def _pick(types, *names):
+    """Return a numeric stat, or None if it is missing.
+
+    A key present with a null value is treated as missing, not zero, so
+    unfinished/unreported fixture stats are excluded from hit rates.
+    """
     for name in names:
         if name in types and types[name] is not None:
             return _num(types[name])
-    # presente pero null
-    for name in names:
-        if name in types:
-            return 0.0
     return None
 
 
@@ -376,6 +377,7 @@ def _finished_fixtures(team_id, last, venue="all", clamp=True):
             "opponent_logo": opponent_logo,
             "goals_for": gf,
             "goals_against": ga,
+            "goals_total": (None if goals_for is None or goals_against is None else gf + ga),
             "btts": 1 if gf > 0 and ga > 0 else 0,
             "result": result,
             "score": f"{int(gf)}-{int(ga)}",
@@ -401,6 +403,18 @@ def _enrich_team_row(row, team_id):
     corners_against = _pick(opp, "Corner Kicks")
     yellow = _pick(mine, "Yellow Cards")
     red = _pick(mine, "Red Cards")
+    yellow_opp = _pick(opp, "Yellow Cards")
+    red_opp = _pick(opp, "Red Cards")
+
+    def _cards(yellow_val, red_val):
+        # Need yellows to trust the card total. A missing red is counted as 0
+        # only when yellows were actually reported.
+        if yellow_val is None:
+            return None
+        return _num(yellow_val) + (_num(red_val) if red_val is not None else 0)
+
+    cards_for = _cards(yellow, red)
+    cards_against = _cards(yellow_opp, red_opp)
     row.update({
         "shots": shots,
         "shots_on_target": sot,
@@ -409,7 +423,9 @@ def _enrich_team_row(row, team_id):
         "corners_total": (None if corners_for is None or corners_against is None else corners_for + corners_against),
         "yellow": yellow,
         "red": red,
-        "cards": (None if yellow is None and red is None else _num(yellow) + _num(red)),
+        "cards": cards_for,
+        "cards_against": cards_against,
+        "cards_total": (None if cards_for is None or cards_against is None else cards_for + cards_against),
         "offsides": _pick(mine, "Offsides"),
         "saves": _pick(mine, "Goalkeeper Saves"),
         "has_stats": bool(mine),
@@ -544,6 +560,7 @@ def _season_finished_fixtures(team_id, season, venue="all"):
             "opponent_logo": opponent_logo,
             "goals_for": gf,
             "goals_against": ga,
+            "goals_total": (None if goals_for is None or goals_against is None else gf + ga),
             "btts": 1 if gf > 0 and ga > 0 else 0,
             "result": result,
             "score": f"{int(gf)}-{int(ga)}",
