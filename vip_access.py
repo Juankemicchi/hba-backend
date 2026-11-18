@@ -119,33 +119,34 @@ def verify_supabase_token(token: str) -> Optional[VipUser]:
     if not url or not token:
         return None
     payload = None
-    secret = os.getenv("SUPABASE_JWT_SECRET")
-    if secret and pyjwt is not None:
-        try:
-            payload = pyjwt.decode(
-                token,
-                secret,
-                algorithms=["HS256"],
-                audience="authenticated",
-                options={"require": ["sub"]},
-            )
-        except Exception:
-            payload = None
-    if payload is None:
-        anon = os.getenv("SUPABASE_ANON_KEY")
-        if not anon:
-            return None
+    anon = os.getenv("SUPABASE_ANON_KEY")
+    # Prefer Auth API so Render does not need SUPABASE_JWT_SECRET.
+    if anon:
         try:
             resp = requests.get(
                 f"{url}/auth/v1/user",
                 headers={"apikey": anon, "Authorization": f"Bearer {token}"},
                 timeout=10,
             )
-            if resp.status_code >= 400:
-                return None
-            payload = resp.json() or {}
+            if resp.status_code < 400:
+                payload = resp.json() or {}
         except Exception:
-            return None
+            payload = None
+    if payload is None:
+        secret = os.getenv("SUPABASE_JWT_SECRET")
+        if secret and pyjwt is not None:
+            try:
+                payload = pyjwt.decode(
+                    token,
+                    secret,
+                    algorithms=["HS256"],
+                    audience="authenticated",
+                    options={"require": ["sub"]},
+                )
+            except Exception:
+                payload = None
+    if not payload:
+        return None
     uid = payload.get("sub") or payload.get("id")
     email = payload.get("email")
     if not uid:
