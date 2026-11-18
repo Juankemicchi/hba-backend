@@ -25,8 +25,12 @@ from football_stats import (
     MARKET_LABELS,
 )
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union, Any, List
 import os
+import time
+import json
+import hashlib
+import threading
 import requests
 from openai import OpenAI
 
@@ -442,6 +446,173 @@ Sé directo. Menciona consistencia, riesgo y si el promedio sostiene la línea. 
         return f"Error al generar análisis: {str(e)}"
 
 
+INSIGHT_TTL = 12 * 60
+_insight_cache = {}
+_insight_inflight = {}
+_insight_mutex = threading.Lock()
+
+
+class InsightRequest(BaseModel):
+    kind: str
+    name: Optional[str] = None
+    entity_id: Optional[Union[str, int]] = None
+    market: Optional[str] = None
+    label: Optional[str] = None
+    line: Optional[Union[str, float, int]] = None
+    side: Optional[str] = None
+    market_kind: Optional[str] = None
+    avg: Optional[float] = None
+    hit_rate: Optional[float] = None
+    hits: Optional[int] = None
+    games: Optional[int] = None
+    yes_rate: Optional[float] = None
+    no_rate: Optional[float] = None
+    lean: Optional[str] = None
+    confidence: Optional[int] = None
+    values: Optional[List[Any]] = None
+    last_n: Optional[int] = None
+    venue: Optional[str] = None
+    opponent: Optional[str] = None
+    form: Optional[str] = None
+    record: Optional[dict] = None
+    team: Optional[str] = None
+    season: Optional[Union[int, str]] = None
+    is_goalkeeper: Optional[bool] = None
+
+
+def _insight_cache_key(req: InsightRequest) -> str:
+    side = req.side or (req.line if req.market_kind == "yesno" else None)
+    payload = {
+        "kind": (req.kind or "").lower(),
+        "id": str(req.entity_id or ""),
+        "name": (req.name or "").strip().lower(),
+        "market": req.market,
+        "line": req.line if req.market_kind != "yesno" else None,
+        "side": side,
+        "last_n": req.last_n,
+        "venue": req.venue or "all",
+        "opponent": (req.opponent or "").strip().lower(),
+        "hit_rate": req.hit_rate,
+        "avg": req.avg,
+        "games": req.games,
+        "hits": req.hits,
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _insight_get(key: str):
+    item = _insight_cache.get(key)
+    if item and time.time() - item["ts"] < INSIGHT_TTL:
+        return item["text"]
+    return None
+
+
+def _insight_set(key: str, text: str):
+    _insight_cache[key] = {"ts": time.time(), "text": text}
+    # prune expired / cap size
+    now = time.time()
+    if len(_insight_cache) > 200:
+        expired = [k for k, v in _insight_cache.items() if now - v["ts"] >= INSIGHT_TTL]
+        for k in expired:
+            _insight_cache.pop(k, None)
+        if len(_insight_cache) > 200:
+            oldest = sorted(_insight_cache.items(), key=lambda kv: kv[1]["ts"])[:50]
+            for k, _ in oldest:
+                _insight_cache.pop(k, None)
+
+
+def generate_market_insight(req: InsightRequest) -> str:
+    is_yesno = (req.market_kind == "yesno") or (str(req.market or "").lower() == "btts")
+    if is_yesno:
+        side_raw = str(req.side or req.line or "yes").lower()
+        side = "No" if side_raw in ("no", "n", "0") else "Sí"
+        line_txt = side
+        market_label = req.label or "Ambos anotan"
+        stats_txt = (
+            f"Mercado: {market_label} (Sí/No). Lado elegido: {side}. "
+            f"Sí en {req.yes_rate}% · No en {req.no_rate}%. "
+            f"Hit rate del lado {side}: {req.hit_rate}% ({req.hits}/{req.games})."
+        )
+        rec_line = f"{req.lean or 'NEUTRAL'} {side} {market_label}"
+    else:
+        line_txt = req.line
+        market_label = req.label or req.market or "el mercado"
+        stats_txt = (
+            f"Mercado: {market_label}. Línea: {line_txt}. "
+            f"Promedio: {req.avg}. Hit rate over: {req.hit_rate}% ({req.hits}/{req.games})."
+        )
+        rec_line = f"{req.lean or 'NEUTRAL'} {line_txt} {market_label}"
+
+    recent_bits = []
+    for row in (req.values or [])[:8]:
+        if not isinstance(row, dict):
+            continue
+        date = str(row.get("date") or "")[:10]
+        opp = row.get("opponent") or "Rival"
+        if is_yesno:
+            val = row.get("display") or ("Sí" if row.get("value") in (1, "1", True) else "No")
+        else:
+            val = row.get("value")
+        mark = "HIT" if row.get("over") else "MISS"
+        score = f" {row.get('score')}" if row.get("score") else ""
+        recent_bits.append(f"- {date} vs {opp}{score}: {val} ({mark})")
+    recent = "\n".join(recent_bits) if recent_bits else "- Sin serie reciente"
+
+    extra = []
+    if req.team:
+        extra.append(f"Equipo: {req.team}.")
+    if req.season:
+        extra.append(f"Temporada: {req.season}.")
+    if req.last_n:
+        extra.append(f"Últimos {req.last_n} partidos.")
+    if req.venue and req.venue != "all":
+        extra.append(f"Filtro: {req.venue}.")
+    if req.opponent:
+        extra.append(f"Rival H2H: {req.opponent}.")
+    if req.form:
+        extra.append(f"Forma: {req.form}.")
+    if req.record:
+        rec = req.record
+        extra.append(f"Récord: {rec.get('wins')}W-{rec.get('draws')}E-{rec.get('losses')}D.")
+    kind_name = {"team": "EQUIPO", "player": "JUGADOR", "nba": "JUGADOR NBA"}.get((req.kind or "").lower(), (req.kind or "").upper())
+    lean_pretty = {"SI": "SÍ", "YES": "SÍ"}.get((req.lean or "").upper(), req.lean or "NEUTRAL")
+
+    prompt = f"""Eres un analista de apuestas deportivas profesional.
+Habla en español, breve y basado solo en estos datos. 4 a 6 líneas, sin listas numeradas.
+
+{kind_name}: {req.name or 'N/A'}
+{' '.join(extra)}
+
+{stats_txt}
+Inclinación calculada: {lean_pretty} (confianza {req.confidence or '-'}/5).
+
+Serie reciente del mercado {market_label}:
+{recent}
+
+IMPORTANTE: Analiza EXCLUSIVAMENTE el mercado "{market_label}" y la línea {line_txt}.
+Menciona explícitamente "{market_label}" y la línea {line_txt} en el texto.
+No cambies de mercado ni hables de otra estadística como si fuera la principal.
+
+Cierra con estas dos líneas exactas al final:
+RECOMENDACIÓN: {rec_line}
+CONFIANZA: {req.confidence or 3}/5
+Sé directo. Menciona consistencia, riesgo y si los datos sostienen esta línea."""
+
+    if not os.getenv("XAI_API_KEY"):
+        return f"No hay clave de IA configurada. Mercado {market_label}, línea {line_txt}."
+    try:
+        response = client.chat.completions.create(
+            model="grok-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=350,
+            temperature=0.6,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"Error al generar análisis: {str(e)}"
+
+
 @app.get("/api/football/search")
 def football_search(q: str = "", query: str = ""):
     try:
@@ -576,3 +747,40 @@ def nba_analyze_player(request: NbaPlayerPropsRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/insight")
+def market_insight(request: InsightRequest):
+    kind = (request.kind or "").lower()
+    if kind not in ("team", "player", "nba"):
+        raise HTTPException(status_code=422, detail="kind debe ser team, player o nba")
+    if not request.market and not request.label:
+        raise HTTPException(status_code=422, detail="Indica el mercado a analizar")
+    key = _insight_cache_key(request)
+    cached = _insight_get(key)
+    if cached:
+        return {"ai_analysis": cached, "cached": True}
+
+    with _insight_mutex:
+        ev = _insight_inflight.get(key)
+        if ev is None:
+            ev = threading.Event()
+            _insight_inflight[key] = ev
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        ev.wait(timeout=45)
+        cached = _insight_get(key)
+        if cached:
+            return {"ai_analysis": cached, "cached": True}
+
+    try:
+        text = generate_market_insight(request)
+        _insight_set(key, text)
+        return {"ai_analysis": text, "cached": False}
+    finally:
+        if owner:
+            ev.set()
+            with _insight_mutex:
+                _insight_inflight.pop(key, None)
