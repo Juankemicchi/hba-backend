@@ -500,7 +500,6 @@ def analyze_slip(req: SlipRequest) -> dict:
             "error": errors[0] if errors else "No se pudieron leer selecciones. Escribe tus picks o sube una captura.",
             "picks": [],
             "parlay": None,
-            "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
         }
 
     picks = []
@@ -554,5 +553,4 @@ def analyze_slip(req: SlipRequest) -> dict:
         "errors": errors,
         "picks": picks,
         "parlay": parlay,
-        "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
     }

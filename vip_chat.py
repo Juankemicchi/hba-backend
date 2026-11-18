@@ -23,7 +23,7 @@ SYSTEM = (
     "Nunca inventes hit rates, promedios, alineaciones, cuotas ni resultados. "
     "Si una herramienta falla o no hay muestra suficiente, dilo con claridad. "
     "Cuando hables de un mercado, incluye hit rate, hits/juegos y la línea usada. "
-    "Cierra recordando solo esto si hace falta: +18. Apuesta bajo tu propia responsabilidad. No menciones proveedores, APIs ni fuentes."
+    "No des consejos de apuesta. No menciones proveedores, APIs ni fuentes."
 )
 
 TOOLS = [
@@ -294,7 +294,6 @@ def vip_chat(req: ChatRequest) -> dict:
                     "ok": True,
                     "message": text,
                     "used_tools": used_tools,
-                    "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
                 }
             messages.append({
                 "role": "assistant",
