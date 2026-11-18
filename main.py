@@ -1,7 +1,16 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from nba_module import analyze_prop
-from football_module import get_team_stats, get_h2h
+from football_module import (
+    get_team_stats,
+    get_h2h,
+    get_teams,
+    get_players,
+    get_squad,
+    get_leagues,
+    get_standings,
+    DEFAULT_LEAGUE,
+)
 from pydantic import BaseModel
 import os
 import requests
@@ -34,11 +43,15 @@ class PropRequest(BaseModel):
 
 class FootballTeamRequest(BaseModel):
     team: str
+    league: int = None
+    season: int = None
 
 class FootballH2HRequest(BaseModel):
     team1: str
     team2: str
     last: int = 10
+    league: int = None
+    season: int = None
 
 @app.get("/")
 def root():
@@ -90,6 +103,114 @@ Genera un análisis de 4 a 6 líneas que incluya promedio vs línea, consistenci
     except Exception as e:
         return f"Error al generar análisis: {str(e)}"
 
+def _fmt_matches(matches, limit=6):
+    lines = []
+    for m in (matches or [])[:limit]:
+        date = (m.get("date") or "")[:10]
+        score = f"{m.get('goals_home')}-{m.get('goals_away')}"
+        if m.get("goals_home") is None:
+            score = m.get("status") or "vs"
+        lines.append(f"- {date} {m.get('home')} {score} {m.get('away')} ({m.get('league') or ''})")
+    return "\n".join(lines) if lines else "- Sin partidos recientes"
+
+def _fmt_standing(standing):
+    if not standing:
+        return "Sin datos de tabla"
+    group = f" ({standing.get('group')})" if standing.get("group") else ""
+    form = standing.get("form") or "-"
+    return (
+        f"Puesto {standing.get('rank')}{group}, {standing.get('points')} pts, "
+        f"{standing.get('played')} PJ, {standing.get('win')}W-{standing.get('draw')}E-{standing.get('lose')}D, "
+        f"goles {standing.get('goals_for')}-{standing.get('goals_against')}, racha {form}"
+    )
+
+def _fmt_injuries(injuries):
+    if not injuries:
+        return "Sin lesionados reportados"
+    parts = []
+    for inj in injuries[:8]:
+        reason = inj.get("reason") or inj.get("type") or ""
+        parts.append(f"{inj.get('name')}{f' ({reason})' if reason else ''}")
+    extra = f" y {len(injuries) - 8} más" if len(injuries) > 8 else ""
+    return ", ".join(parts) + extra
+
+def _fmt_form(stats):
+    if not stats:
+        return "Sin estadísticas"
+    form = stats.get("form") or "-"
+    return (
+        f"Forma {form}; {stats.get('played')} PJ, {stats.get('wins')}W-{stats.get('draws')}E-{stats.get('loses')}D, "
+        f"goles {stats.get('goals_for')}-{stats.get('goals_against')}"
+    )
+
+def generate_football_team_analysis(ctx: dict):
+    team = (ctx.get("team") or {}).get("name") or "Equipo"
+    league = ctx.get("league") or {}
+    prompt = f"""Eres un analista de apuestas deportivas profesional.
+Habla de forma natural, en español, como un tipster que analiza fútbol.
+
+Equipo: {team}
+Liga: {league.get('name') or '-'} ({league.get('country') or ''})
+Temporada: {ctx.get('season')}
+Tabla: {_fmt_standing(ctx.get('standing'))}
+Estadísticas: {_fmt_form(ctx.get('statistics'))}
+Lesionados: {_fmt_injuries(ctx.get('injuries'))}
+Últimos partidos:
+{_fmt_matches(ctx.get('recent_matches'))}
+
+Genera un análisis de 4 a 6 líneas sobre el momento del equipo, consistencia, bajas importantes, nivel de riesgo para apostar y una conclusión clara. Sé directo y profesional. No uses listas numeradas."""
+
+    try:
+        response = client.chat.completions.create(
+            model="grok-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=350,
+            temperature=0.75
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error al generar análisis: {str(e)}"
+
+def generate_football_h2h_analysis(h2h: dict, team1: str, team2: str):
+    ctx1 = h2h.get("team1") or {}
+    ctx2 = h2h.get("team2") or {}
+    prompt = f"""Eres un analista de apuestas deportivas profesional.
+Habla de forma natural, en español, como un tipster que analiza fútbol.
+
+Cara a cara: {team1} vs {team2}
+
+{(ctx1.get('team') or {}).get('name') or team1}:
+- Liga: {((ctx1.get('league') or {}).get('name')) or '-'}
+- Tabla: {_fmt_standing(ctx1.get('standing'))}
+- Forma: {_fmt_form(ctx1.get('statistics'))}
+- Lesionados: {_fmt_injuries(ctx1.get('injuries'))}
+- Recientes:
+{_fmt_matches(ctx1.get('recent_matches'))}
+
+{(ctx2.get('team') or {}).get('name') or team2}:
+- Liga: {((ctx2.get('league') or {}).get('name')) or '-'}
+- Tabla: {_fmt_standing(ctx2.get('standing'))}
+- Forma: {_fmt_form(ctx2.get('statistics'))}
+- Lesionados: {_fmt_injuries(ctx2.get('injuries'))}
+- Recientes:
+{_fmt_matches(ctx2.get('recent_matches'))}
+
+Historial H2H (más reciente primero):
+{_fmt_matches(h2h.get('matches'), 8)}
+
+Genera un análisis de 4 a 6 líneas que compare momento de ambos equipos, el historial, bajas y una conclusión clara para el mercado 1X2 o goles. Sé directo y profesional. No uses listas numeradas."""
+
+    try:
+        response = client.chat.completions.create(
+            model="grok-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.75
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error al generar análisis: {str(e)}"
+
 @app.post("/analyze")
 def analyze(request: PropRequest):
     try:
@@ -133,23 +254,72 @@ def analyze(request: PropRequest):
 @app.post("/football/team")
 def analyze_football_team(request: FootballTeamRequest):
     try:
-        stats = get_team_stats(request.team)
+        stats = get_team_stats(request.team, request.league, request.season)
         if not stats:
             raise HTTPException(status_code=404, detail="No se encontraron datos del equipo")
-        return {"team": request.team, "stats": stats}
+        ai_analysis = generate_football_team_analysis(stats)
+        return {"team": request.team, "stats": stats, "ai_analysis": ai_analysis}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/football/h2h")
 def football_h2h(request: FootballH2HRequest):
     try:
-        h2h = get_h2h(request.team1, request.team2, request.last)
+        h2h = get_h2h(request.team1, request.team2, request.last, request.league, request.season)
         if not h2h:
             raise HTTPException(status_code=404, detail="No se encontró historial")
+        ai_analysis = generate_football_h2h_analysis(h2h, request.team1, request.team2)
         return {
             "team1": request.team1,
             "team2": request.team2,
-            "matches": h2h.get("matches", [])
+            "matches": h2h.get("matches", []),
+            "team1_data": h2h.get("team1"),
+            "team2_data": h2h.get("team2"),
+            "ai_analysis": ai_analysis
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/football/leagues")
+def football_leagues(country: str = None, search: str = None):
+    try:
+        return get_leagues(country=country, search=search)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/football/teams")
+def football_teams(league: int = DEFAULT_LEAGUE, season: int = None):
+    try:
+        return get_teams(league, season)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/football/standings")
+def football_standings(league: int = DEFAULT_LEAGUE, season: int = None):
+    try:
+        return get_standings(league, season)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/football/players")
+def football_players(team: int, season: int = None, page: int = 1, league: int = None):
+    try:
+        return get_players(team, season, page, league)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/football/squad")
+def football_squad(team: int):
+    try:
+        data = get_squad(team)
+        if not data.get("players"):
+            raise HTTPException(status_code=404, detail="No se encontró la plantilla")
+        return data
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
