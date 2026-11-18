@@ -55,7 +55,7 @@ ALL_LEAGUE_IDS = [c["id"] for c in FOOTBALL_COMPETITIONS]
 # Modest default "all" set — popular + local. Still capped at MAX_FIXTURES.
 ALL_PRIORITY_IDS = [239, 71, 39, 140, 2, 135, 13]
 
-_cache_lock = threading.Lock()
+_cache_lock = threading.RLock()
 _memory_cache: dict = {}
 _fixture_picks_lock = threading.Lock()
 _fixture_picks_cache: dict = {}
