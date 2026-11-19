@@ -2015,6 +2015,47 @@ def warm_picks_cache(force: bool = False) -> dict:
     return report
 
 
+
+def _has_today_slate() -> bool:
+    """True when a same-day VIP slate is already in memory or the cache file."""
+    today = _today()
+    prefix = f"v7|{today}|"
+    now = time.time()
+    with _cache_lock:
+        items = list(_memory_cache.items())
+    for key, item in items:
+        if not str(key).startswith(prefix):
+            continue
+        found = _cache_fresh(item, now, allow_stale=True)
+        if found and isinstance(found.get("data"), dict) and found["data"].get("date") == today:
+            return True
+    try:
+        if CACHE_FILE.exists():
+            store = json.loads(CACHE_FILE.read_text()) or {}
+            for key, item in store.items():
+                if not str(key).startswith(prefix):
+                    continue
+                found = _cache_fresh(item, now, allow_stale=True)
+                if found and isinstance(found.get("data"), dict) and found["data"].get("date") == today:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _grade_on_wake():
+    """Grade leftover picks as soon as the process wakes, without waiting for warmup."""
+    try:
+        from vip_history import grade_pending
+        grade_pending()
+        yesterday = (datetime.now(BOGOTA).date() - timedelta(days=1)).isoformat()
+        # Second pass if yesterday still has pending rows after results landed.
+        grade_pending()
+        return yesterday
+    except Exception:
+        return None
+
+
 def start_picks_background():
     """Warm the slates on boot and refresh them on the 45-minute odds cadence."""
     global _bg_started
@@ -2034,10 +2075,14 @@ def start_picks_background():
         first = True
         last_forced_date = None
         last_morning_date = None
+        # Grade yesterday immediately on wake so we don't wait for a long
+        # 15-game warmup if the instance slept through 00:05.
+        threading.Thread(target=_grade_on_wake, name="vip-grade-wake", daemon=True).start()
         while True:
             now = datetime.now(BOGOTA)
             today = _today()
-            new_day = last_forced_date is not None and last_forced_date != today
+            missing_today = not _has_today_slate()
+            new_day = (last_forced_date is not None and last_forced_date != today) or missing_today
             morning = (
                 last_morning_date != today
                 and (now.hour, now.minute) >= (7, 0)
@@ -2047,10 +2092,14 @@ def start_picks_background():
             # Overnight we keep the process awake, but only force a new-day
             # slate at 00:05 and a fresh-odds pass at 07:00, to stay inside
             # the API-Football Pro daily cap.
+            # If the process slept through midnight, missing_today forces an
+            # immediate compute on any wake.
             daytime = 7 <= now.hour <= 23
             try:
-                warm_picks_cache(force=(not first and daytime) or new_day or morning)
-                if new_day or last_forced_date is None:
+                warm_picks_cache(
+                    force=(not first and daytime) or new_day or morning or missing_today
+                )
+                if new_day or missing_today or last_forced_date is None:
                     last_forced_date = _today()
                 if morning:
                     last_morning_date = _today()
@@ -2065,7 +2114,7 @@ def start_picks_background():
                 pass
             first = False
             now = datetime.now(BOGOTA)
-            if last_forced_date == _today() and now.hour < 7:
+            if last_forced_date == _today() and now.hour < 7 and _has_today_slate():
                 delay = _seconds_until_clock(7, 0)
             else:
                 delay = min(SLATE_TTL, _seconds_until_clock(0, 5), _seconds_until_clock(7, 0))
