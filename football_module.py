@@ -85,16 +85,17 @@ def _raise_api_errors(data):
         raise ValueError(msg)
 
 
-def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE):
+def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE, force: bool = False):
     if not API_KEY:
         raise ValueError("Faltan credenciales de datos en este entorno.")
 
     clean_params = {k: v for k, v in params.items() if v is not None and v != ""}
     key = _cache_key(path, clean_params)
-    cached = _cache_get(key)
-    if cached is not None:
-        _raise_api_errors(cached)
-        return cached
+    if not force:
+        cached = _cache_get(key)
+        if cached is not None:
+            _raise_api_errors(cached)
+            return cached
 
     response = requests.get(
         f"{BASE_URL}{path}",
