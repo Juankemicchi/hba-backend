@@ -33,7 +33,8 @@ from vip_access import (
     payment_secret,
     apply_vip_from_payment,
 )
-from vip_picks import list_vip_competitions, get_daily_picks, start_picks_background
+from vip_picks import list_vip_competitions, get_daily_picks, start_picks_background, get_warmup_status
+from vip_history import list_history
 from vip_slip import SlipRequest, analyze_slip
 from vip_chat import ChatRequest, vip_chat
 from pydantic import BaseModel
@@ -120,7 +121,12 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    warm = get_warmup_status()
+    return {
+        "ok": True,
+        "warmup_seconds": warm.get("seconds"),
+        "warmup_at": warm.get("finished_at"),
+    }
 
 
 @app.on_event("startup")
@@ -835,6 +841,14 @@ def vip_competitions(_user=Depends(require_vip)):
 def vip_picks(sport: str = "all", league: Optional[int] = None, _user=Depends(require_vip)):
     try:
         return get_daily_picks(sport=sport, league_id=league)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/vip/history")
+def vip_pick_history(_user=Depends(require_vip)):
+    try:
+        return list_history()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

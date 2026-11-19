@@ -23,13 +23,13 @@ from openai import OpenAI
 BOGOTA = ZoneInfo("America/Bogota")
 
 MIN_MINUTES = 24.0
-MIN_PLAYED_RECENT = 8
-LOOKBACK_RECENT = 10
+MIN_PLAYED_RECENT = 12
+LOOKBACK_RECENT = 15
 LOOKBACK_SEASON = 25
 DNP_MINUTES = 8.0
 MIN_HIT_RECENT = 70.0
 MIN_HIT_SEASON = 55.0
-LINE_MAX_GAP = 1.0  # line must stay within 1.0 of the last-10 median
+LINE_MAX_GAP = 1.0  # line must stay within 1.0 of the last-15 median
 MAX_PLAYERS_PER_TEAM = 18
 MAX_PROPS_PER_PLAYER = 1
 MAX_PROPS_PER_GAME = 2
@@ -425,8 +425,8 @@ def _build_player_candidates(player: dict, game: dict, venue: str, opponent: str
                 "avg_season": round(avg_s, 1) if avg_s is not None else None,
                 "median": med_r,
                 "avg_minutes": avg_min,
-                "confidence": 5 if hit >= 80 and games >= 8 else (4 if hit >= 70 else 3),
-                "risk": "baja" if hit >= 80 and games >= 8 else ("media" if hit >= 70 else "alta"),
+                "confidence": 5 if hit >= 80 and games >= 12 else (4 if hit >= 70 else 3),
+                "risk": "baja" if hit >= 80 and games >= 12 else ("media" if hit >= 70 else "alta"),
                 "entity": player.get("name"),
                 "entity_id": player.get("id"),
                 "entity_side": venue,
@@ -816,7 +816,7 @@ def enrich_props_with_grok_lines(picks: list[dict]) -> tuple[list[dict], dict]:
             pick["hit_rate_at_book"] = hit_b
             pick["hits_at_book"] = hits_b
             pick["games_at_book"] = games_b
-            if games_b < 8 or hit_b < 70:
+            if games_b < 12 or hit_b < 70:
                 pick["book_conflict"] = True
                 pick["book_conflict_reason"] = "hit_at_book"
                 rejected += 1

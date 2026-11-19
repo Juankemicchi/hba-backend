@@ -32,7 +32,7 @@ SLATE_TTL = 45 * 60
 STALE_MAX = 12 * 60 * 60
 MAX_FIXTURES = 6
 NBA_MAX_FIXTURES = 12
-LAST_N = 8
+LAST_N = 15
 CACHE_FILE = Path(os.getenv("VIP_PICKS_CACHE_FILE", "/tmp/hba_vip_picks_cache.json"))
 WARM_WORKERS = 2
 
@@ -123,7 +123,7 @@ def list_vip_competitions() -> dict:
 
 
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
-    return f"v6|{date_str}|{sport}|{league_id or 'all'}|{window}"
+    return f"v7|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
 def _cache_fresh(item: Optional[dict], now: Optional[float] = None, allow_stale: bool = False):
@@ -250,6 +250,11 @@ def _cache_set(key: str, data: dict):
         except Exception:
             pass
     _supabase_cache_set(key, item)
+    try:
+        from vip_history import publish_slate
+        publish_slate(data)
+    except Exception:
+        pass
 
 
 def _xai_client() -> Optional[OpenAI]:
@@ -262,7 +267,7 @@ def _xai_client() -> Optional[OpenAI]:
 def _risk(hit: float, games: int) -> str:
     if games < 5:
         return "alta"
-    if hit >= 75 and games >= 8:
+    if hit >= 75 and games >= 12:
         return "baja"
     if hit >= 65:
         return "media"
@@ -274,7 +279,7 @@ def _confidence(hit: float, games: int, lean: str) -> int:
         return 2
     if lean in ("NEUTRAL", "") and 40 <= hit <= 60:
         return 2
-    if hit >= 75 and games >= 8:
+    if hit >= 75 and games >= 12:
         return 5
     if hit >= 70:
         return 4
@@ -717,9 +722,19 @@ def _match_btts(home_a: dict, away_a: dict, fixture: dict) -> Optional[dict]:
     }
 
 
+_team_hist_lock = threading.Lock()
+_team_hist: dict = {}
+
+
 def _analyze_football_team(team_id: int, league_id: int, venue: Optional[str] = None) -> Optional[dict]:
+    """VIP-only 15-match window, cached per team/day to protect API quota."""
+    key = (int(team_id), int(league_id), venue or "all", LAST_N, _today())
+    with _team_hist_lock:
+        hit = _team_hist.get(key)
+        if hit is not None:
+            return copy.deepcopy(hit)
     try:
-        return fs.analyze_team_props(
+        data = fs.analyze_team_props(
             team_id=int(team_id),
             league=int(league_id),
             last_n=LAST_N,
@@ -727,6 +742,9 @@ def _analyze_football_team(team_id: int, league_id: int, venue: Optional[str] = 
         )
     except Exception:
         return None
+    with _team_hist_lock:
+        _team_hist[key] = data
+    return copy.deepcopy(data) if data else None
 
 
 PREFERRED_TEAM_MARKETS = (
@@ -1549,24 +1567,18 @@ def _rank_top(candidates: list[dict], limit: int = 5) -> list[dict]:
 
 
 def _sample_recent_hits(pick: dict) -> bool:
-    """Most recent sample point(s) must have hit. Match totals check both teams' latest."""
+    """The most recent match in the sample must have hit the line."""
     values = pick.get("sample_values") or pick.get("recent_values") or []
     line = pick.get("line")
     side = pick.get("selection")
     if not values or line is None or side not in {"Over", "Under"}:
         return False
-
-    def _ok(val) -> bool:
-        try:
-            v = float(val)
-        except (TypeError, ValueError):
-            return False
-        return v <= float(line) if side == "Under" else v > float(line)
-
-    idxs = [0]
-    if pick.get("entity_side") == "match" and len(values) >= 10:
-        idxs.append(len(values) // 2)
-    return all(_ok(values[i]) for i in idxs if i < len(values))
+    try:
+        v = float(values[0])
+        line = float(line)
+    except (TypeError, ValueError, IndexError):
+        return False
+    return v <= line if side == "Under" else v > line
 
 
 def _is_maxima_confianza(pick: dict) -> bool:
@@ -1587,7 +1599,7 @@ def _is_maxima_confianza(pick: dict) -> bool:
         edge = float(pick.get("edge") or 0)
     except (TypeError, ValueError):
         return False
-    if hit < 80 or games < 8 or books < 3 or odd < 1.40 or edge <= 0:
+    if hit < 80 or games < 12 or books < 3 or odd < 1.40 or edge <= 0:
         return False
     if not _sample_recent_hits(pick):
         return False
@@ -1930,8 +1942,16 @@ def _warm_targets():
     return targets
 
 
+LAST_WARMUP = {"seconds": None, "finished_at": None, "ok": 0, "skipped": 0, "errors": 0}
+
+
+def get_warmup_status() -> dict:
+    return dict(LAST_WARMUP)
+
+
 def warm_picks_cache(force: bool = False) -> dict:
     """Precompute NBA, each football league, then Todos. Reuses fixture/slate cache."""
+    started = time.time()
     report = {"ok": [], "skipped": [], "errors": []}
 
     def _one(sport: str, league_id: Optional[int]):
@@ -1969,6 +1989,13 @@ def warm_picks_cache(force: bool = False) -> dict:
             except Exception as exc:
                 s, lid = futs[fut]
                 report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
+    LAST_WARMUP.update({
+        "seconds": round(time.time() - started, 1),
+        "finished_at": datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M"),
+        "ok": len(report["ok"]),
+        "skipped": len(report["skipped"]),
+        "errors": len(report["errors"]),
+    })
     return report
 
 
@@ -1985,6 +2012,15 @@ def start_picks_background():
         while True:
             try:
                 warm_picks_cache(force=not first)
+            except Exception:
+                pass
+            try:
+                from vip_history import grade_pending
+                grade_pending()
+                # Late-night Bogotá pass: once the evening slate has settled,
+                # walk pending rows again after 22:00.
+                if datetime.now(BOGOTA).hour >= 22:
+                    grade_pending()
             except Exception:
                 pass
             first = False
