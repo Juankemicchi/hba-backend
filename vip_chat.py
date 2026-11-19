@@ -278,13 +278,25 @@ def vip_chat(req: ChatRequest) -> dict:
     used_tools = []
     try:
         for _round in range(MAX_TOOL_ROUNDS + 1):
-            resp = client.chat.completions.create(
-                model="grok-4",
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.3,
-            )
+            try:
+                resp = client.chat.completions.create(
+                    model=os.getenv("GROK_FAST_MODEL", "grok-4.3"),
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.3,
+                    max_tokens=600,
+                    extra_body={"reasoning_effort": "none"},
+                )
+            except Exception:
+                resp = client.chat.completions.create(
+                    model="grok-4",
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.3,
+                    max_tokens=600,
+                )
             choice = resp.choices[0]
             msg = choice.message
             tool_calls = getattr(msg, "tool_calls", None) or []
