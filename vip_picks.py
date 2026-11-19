@@ -2043,8 +2043,13 @@ def start_picks_background():
                 and (now.hour, now.minute) >= (7, 0)
                 and now.hour < 10
             )
+            # Refresh odds on the 45-minute cadence during the day only.
+            # Overnight we keep the process awake, but only force a new-day
+            # slate at 00:05 and a fresh-odds pass at 07:00, to stay inside
+            # the API-Football Pro daily cap.
+            daytime = 7 <= now.hour <= 23
             try:
-                warm_picks_cache(force=not first or new_day or morning)
+                warm_picks_cache(force=(not first and daytime) or new_day or morning)
                 if new_day or last_forced_date is None:
                     last_forced_date = _today()
                 if morning:
@@ -2054,15 +2059,16 @@ def start_picks_background():
             try:
                 from vip_history import grade_pending
                 grade_pending()
-                # Late-night Bogotá pass: once the evening slate has settled,
-                # walk pending rows again after 22:00.
                 if datetime.now(BOGOTA).hour >= 22:
                     grade_pending()
             except Exception:
                 pass
             first = False
-            delay = SLATE_TTL
-            delay = min(delay, _seconds_until_clock(0, 5), _seconds_until_clock(7, 0))
+            now = datetime.now(BOGOTA)
+            if last_forced_date == _today() and now.hour < 7:
+                delay = _seconds_until_clock(7, 0)
+            else:
+                delay = min(SLATE_TTL, _seconds_until_clock(0, 5), _seconds_until_clock(7, 0))
             time.sleep(max(15, delay))
 
     threading.Thread(target=_loop, name="vip-picks-warm", daemon=True).start()
