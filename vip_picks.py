@@ -744,6 +744,17 @@ def _analyze_football_team(team_id: int, league_id: int, venue: Optional[str] = 
         return None
     with _team_hist_lock:
         _team_hist[key] = data
+    # Fill the dashboard default (last 10) from already-cached fixture stats.
+    if LAST_N != 10:
+        try:
+            fs.analyze_team_props(
+                team_id=int(team_id),
+                league=int(league_id),
+                last_n=10,
+                venue="all",
+            )
+        except Exception:
+            pass
     return copy.deepcopy(data) if data else None
 
 
@@ -1942,7 +1953,7 @@ def _warm_targets():
     return targets
 
 
-LAST_WARMUP = {"seconds": None, "finished_at": None, "ok": 0, "skipped": 0, "errors": 0}
+LAST_WARMUP = {"seconds": None, "finished_at": None, "started_at": None, "ok": 0, "skipped": 0, "errors": 0, "running": False}
 
 
 def get_warmup_status() -> dict:
@@ -1952,6 +1963,10 @@ def get_warmup_status() -> dict:
 def warm_picks_cache(force: bool = False) -> dict:
     """Precompute NBA, each football league, then Todos. Reuses fixture/slate cache."""
     started = time.time()
+    LAST_WARMUP.update({
+        "started_at": datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M"),
+        "running": True,
+    })
     report = {"ok": [], "skipped": [], "errors": []}
 
     def _one(sport: str, league_id: Optional[int]):
@@ -1995,6 +2010,7 @@ def warm_picks_cache(force: bool = False) -> dict:
         "ok": len(report["ok"]),
         "skipped": len(report["skipped"]),
         "errors": len(report["errors"]),
+        "running": False,
     })
     return report
 
@@ -2007,11 +2023,32 @@ def start_picks_background():
             return
         _bg_started = True
 
+    def _seconds_until_clock(hour: int, minute: int) -> float:
+        now = datetime.now(BOGOTA)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
+
     def _loop():
         first = True
+        last_forced_date = None
+        last_morning_date = None
         while True:
+            now = datetime.now(BOGOTA)
+            today = _today()
+            new_day = last_forced_date is not None and last_forced_date != today
+            morning = (
+                last_morning_date != today
+                and (now.hour, now.minute) >= (7, 0)
+                and now.hour < 10
+            )
             try:
-                warm_picks_cache(force=not first)
+                warm_picks_cache(force=not first or new_day or morning)
+                if new_day or last_forced_date is None:
+                    last_forced_date = _today()
+                if morning:
+                    last_morning_date = _today()
             except Exception:
                 pass
             try:
@@ -2024,6 +2061,8 @@ def start_picks_background():
             except Exception:
                 pass
             first = False
-            time.sleep(SLATE_TTL)
+            delay = SLATE_TTL
+            delay = min(delay, _seconds_until_clock(0, 5), _seconds_until_clock(7, 0))
+            time.sleep(max(15, delay))
 
     threading.Thread(target=_loop, name="vip-picks-warm", daemon=True).start()
