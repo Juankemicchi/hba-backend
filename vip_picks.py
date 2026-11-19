@@ -2044,18 +2044,21 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
     if found:
         out = copy.deepcopy(found["data"])
         out["cached"] = True
-        if found.get("stale") and (remaining is None or remaining >= fm.QUOTA_SKIP_BACKGROUND):
+        # Do not background-refresh slates when the remaining budget is tight.
+        if found.get("stale") and (remaining is None or remaining >= 2000):
             _schedule_refresh(sport, league_id, key)
         return out
-    if remaining is not None and remaining < fm.QUOTA_CACHE_ONLY:
+    # After a deploy the in-memory cache is empty. A single VIP picks
+    # request used to recompute the full 15-game slate (~200 calls).
+    # When remaining is under 2000, serve today's published history instead.
+    if remaining is not None and remaining < 2000:
         hist = _slate_from_history(sport, league_id)
         if hist:
             return hist
-        raise RuntimeError("Cuota diaria casi agotada; se sirve solo la caché.")
-    if remaining is not None and remaining < fm.QUOTA_SKIP_BACKGROUND:
-        hist = _slate_from_history(sport, league_id)
-        if hist:
-            return hist
+        if remaining < fm.QUOTA_CACHE_ONLY:
+            raise RuntimeError("Cuota diaria casi agotada; se sirve solo la caché.")
+        if remaining < fm.QUOTA_SKIP_BACKGROUND:
+            raise RuntimeError("Cuota diaria baja; no se puede recalcular la pizarra.")
     return _compute_slate(sport, league_id, reuse=True)
 
 
