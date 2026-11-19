@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import time
 import requests
 from pathlib import Path
@@ -18,6 +19,164 @@ CACHE_FILE = Path(os.getenv("FOOTBALL_CACHE_FILE", "/tmp/hba_football_cache.json
 
 _memory_cache = {}
 _cache_io_lock = threading.Lock()
+
+LOGGER = logging.getLogger("hba.quota")
+
+# Skip background warmup / refresh / grading fetches below this remaining count.
+QUOTA_SKIP_BACKGROUND = 1000
+# Serve cache only, except on-demand user stats, below this remaining count.
+QUOTA_CACHE_ONLY = 300
+# Hard cap on uncached API-Football calls in one background cycle.
+CYCLE_CALL_CAP = 200
+
+_quota_lock = threading.Lock()
+_quota_state = {
+    "current": None,
+    "limit_day": 7500,
+    "remaining": None,
+    "ts": 0,
+    "process_calls": 0,
+}
+_request_mode = threading.local()
+_cycle_lock = threading.Lock()
+_active_cycle = None
+
+
+def set_request_mode(mode: str):
+    """mode is user_stats, user_picks, or background."""
+    _request_mode.value = mode or "background"
+
+
+def get_request_mode() -> str:
+    return getattr(_request_mode, "value", None) or "background"
+
+
+def begin_call_cycle(name: str, cap: int = CYCLE_CALL_CAP):
+    global _active_cycle
+    with _cycle_lock:
+        _active_cycle = {
+            "name": name,
+            "cap": int(cap),
+            "calls": 0,
+            "skipped": 0,
+            "started": time.time(),
+        }
+
+
+def end_call_cycle():
+    global _active_cycle
+    with _cycle_lock:
+        cycle = _active_cycle
+        _active_cycle = None
+    if not cycle:
+        return None
+    with _quota_lock:
+        remaining = _quota_state.get("remaining")
+        process_calls = _quota_state.get("process_calls") or 0
+    cycle["seconds"] = round(time.time() - cycle["started"], 1)
+    cycle["remaining"] = remaining
+    cycle["process_calls"] = process_calls
+    msg = (
+        f"HBA-QUOTA cycle={cycle['name']} calls={cycle['calls']} "
+        f"skipped={cycle['skipped']} cap={cycle['cap']} "
+        f"remaining={remaining} seconds={cycle['seconds']}"
+    )
+    print(msg, flush=True)
+    try:
+        LOGGER.info(msg)
+    except Exception:
+        pass
+    return cycle
+
+
+def last_cycle_snapshot():
+    with _cycle_lock:
+        if _active_cycle:
+            return dict(_active_cycle)
+    return None
+
+
+def cycle_budget_left() -> bool:
+    with _cycle_lock:
+        cycle = _active_cycle
+        if not cycle:
+            return True
+        return cycle["calls"] < cycle["cap"]
+
+
+def _note_cycle_skip():
+    with _cycle_lock:
+        if _active_cycle:
+            _active_cycle["skipped"] += 1
+
+
+def _note_cycle_call():
+    with _cycle_lock:
+        if _active_cycle:
+            _active_cycle["calls"] += 1
+            return _active_cycle["calls"], _active_cycle["cap"], _active_cycle["name"]
+    return None, None, None
+
+
+def _remember_quota(current, limit_day, remaining=None):
+    with _quota_lock:
+        if current is not None:
+            try:
+                _quota_state["current"] = int(current)
+            except (TypeError, ValueError):
+                pass
+        if limit_day:
+            try:
+                _quota_state["limit_day"] = int(limit_day)
+            except (TypeError, ValueError):
+                pass
+        if remaining is None and _quota_state["current"] is not None and _quota_state["limit_day"]:
+            remaining = int(_quota_state["limit_day"]) - int(_quota_state["current"])
+        if remaining is not None:
+            try:
+                _quota_state["remaining"] = int(remaining)
+            except (TypeError, ValueError):
+                pass
+        _quota_state["ts"] = time.time()
+
+
+def _consume_one_call():
+    with _quota_lock:
+        _quota_state["process_calls"] = int(_quota_state.get("process_calls") or 0) + 1
+        if _quota_state.get("remaining") is not None:
+            _quota_state["remaining"] = max(0, int(_quota_state["remaining"]) - 1)
+        if _quota_state.get("current") is not None:
+            _quota_state["current"] = int(_quota_state["current"]) + 1
+        return _quota_state.get("remaining"), _quota_state.get("process_calls")
+
+
+def quota_remaining(refresh: bool = False):
+    """Estimated remaining API-Football calls for today."""
+    if refresh:
+        snap = usage_snapshot()
+        if snap and snap.get("remaining") is not None:
+            return snap.get("remaining")
+    with _quota_lock:
+        return _quota_state.get("remaining")
+
+
+def quota_guard_snapshot():
+    with _quota_lock:
+        state = {
+            "process_calls": _quota_state.get("process_calls") or 0,
+            "remaining_est": _quota_state.get("remaining"),
+            "current_est": _quota_state.get("current"),
+        }
+    state["active_cycle"] = last_cycle_snapshot()
+    return state
+
+
+def background_fetches_allowed() -> bool:
+    remaining = quota_remaining()
+    if remaining is None:
+        return True
+    return remaining >= QUOTA_SKIP_BACKGROUND
+
 
 
 def _cache_key(path, params):
@@ -43,18 +202,32 @@ def _write_file_cache(store):
         pass
 
 
-def _cache_get(key):
-    now = time.time()
+def _cache_entry(key):
     with _cache_io_lock:
         entry = _memory_cache.get(key)
-        if entry and now - entry["ts"] < entry.get("ttl", CACHE_TTL_STABLE):
-            return entry["data"]
+        if entry:
+            return entry
         store = _read_file_cache()
         entry = store.get(key)
-        if entry and now - entry["ts"] < entry.get("ttl", CACHE_TTL_STABLE):
+        if entry:
             _memory_cache[key] = entry
-            return entry["data"]
+        return entry
+
+
+def _cache_get(key, allow_stale: bool = False):
+    now = time.time()
+    entry = _cache_entry(key)
+    if not entry:
         return None
+    if allow_stale or now - entry.get("ts", 0) < entry.get("ttl", CACHE_TTL_STABLE):
+        return entry.get("data")
+    return None
+
+
+def peek_cached(path: str, params: dict, allow_stale: bool = False):
+    """Return a cached API payload without spending a call, if present."""
+    clean_params = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+    return _cache_get(_cache_key(path, clean_params), allow_stale=allow_stale)
 
 
 def _cache_set(key, data, ttl):
@@ -85,6 +258,27 @@ def _raise_api_errors(data):
         raise ValueError(msg)
 
 
+def _empty_payload():
+    return {"response": [], "results": 0, "errors": {}}
+
+
+def _guard_blocks_fetch(path: str) -> bool:
+    """Return True when this call must not hit the live API."""
+    mode = get_request_mode()
+    remaining = quota_remaining()
+    if path == "/status" and remaining is None:
+        return False
+    if not cycle_budget_left() and mode != "user_stats":
+        return True
+    if remaining is None:
+        return False
+    if remaining < QUOTA_CACHE_ONLY and mode != "user_stats":
+        return True
+    if remaining < QUOTA_SKIP_BACKGROUND and mode == "background":
+        return True
+    return False
+
+
 def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE, force: bool = False):
     if not API_KEY:
         raise ValueError("Faltan credenciales de datos en este entorno.")
@@ -97,19 +291,47 @@ def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE, force: bool = 
             _raise_api_errors(cached)
             return cached
 
+    blocked = _guard_blocks_fetch(path)
+    if blocked:
+        stale = _cache_get(key, allow_stale=True)
+        _note_cycle_skip()
+        if stale is not None:
+            try:
+                _raise_api_errors(stale)
+            except ValueError:
+                return stale
+            return stale
+        if get_request_mode() == "user_stats":
+            raise ValueError("Se alcanzó el límite de consultas. Intenta más tarde.")
+        return _empty_payload()
+
     response = requests.get(
         f"{BASE_URL}{path}",
         headers=HEADERS,
         params=clean_params,
         timeout=20,
     )
+    remaining, process_calls = _consume_one_call()
+    cycle_calls, cap, cycle_name = _note_cycle_call()
     if response.status_code == 429:
         raise ValueError("Se alcanzó el límite de consultas. Intenta más tarde.")
     if response.status_code != 200:
         raise ValueError(f"Error al consultar los datos: {response.status_code}")
 
     data = response.json()
+    # Official daily tally from API-Football, when present on any response.
+    try:
+        req = ((data.get("response") or {}) if isinstance(data.get("response"), dict) else {}) 
+        # most endpoints do not include usage; /status is handled separately.
+    except Exception:
+        req = {}
     _cache_set(key, data, ttl)
+    if cycle_name:
+        print(
+            f"HBA-QUOTA call path={path} cycle={cycle_name} "
+            f"n={cycle_calls}/{cap} remaining_est={remaining} process_calls={process_calls}",
+            flush=True,
+        )
     _raise_api_errors(data)
     return data
 
@@ -117,9 +339,39 @@ def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE, force: bool = 
 
 def usage_snapshot():
     """Return today's API-Football request count vs the plan daily limit."""
+    with _quota_lock:
+        known = {
+            "current": _quota_state.get("current"),
+            "limit_day": _quota_state.get("limit_day"),
+            "remaining": _quota_state.get("remaining"),
+            "ts": _quota_state.get("ts") or 0,
+        }
+    remaining = known.get("remaining")
+    ttl = 30 * 60 if (remaining is not None and remaining < QUOTA_SKIP_BACKGROUND) else 5 * 60
+    # Reuse a recent snapshot so /health and keep-alives do not spend calls.
+    stale_ok = remaining is not None and remaining < QUOTA_CACHE_ONLY
+    have_recent = known["ts"] and (time.time() - known["ts"] < ttl) and known["remaining"] is not None
+    if have_recent or (stale_ok and known["remaining"] is not None):
+        return {
+            "plan": "Pro",
+            "current": known["current"],
+            "limit_day": known["limit_day"],
+            "remaining": known["remaining"],
+            "active": True,
+            "cached": True,
+        }
     try:
-        data = api_get("/status", {}, ttl=5 * 60)
+        data = api_get("/status", {}, ttl=ttl)
     except Exception:
+        if known["remaining"] is not None:
+            return {
+                "plan": "Pro",
+                "current": known["current"],
+                "limit_day": known["limit_day"],
+                "remaining": known["remaining"],
+                "active": True,
+                "cached": True,
+            }
         return None
     resp = data.get("response") or {}
     if isinstance(resp, list):
@@ -127,19 +379,21 @@ def usage_snapshot():
     sub = resp.get("subscription") or {}
     req = sub.get("requests") or resp.get("requests") or {}
     current = req.get("current")
-    limit_day = req.get("limit_day") or req.get("limit_day") or req.get("limit")
+    limit_day = req.get("limit_day") or req.get("limit")
     remaining = None
     try:
         if current is not None and limit_day:
             remaining = int(limit_day) - int(current)
     except (TypeError, ValueError):
         remaining = None
+    _remember_quota(current, limit_day, remaining)
     return {
         "plan": sub.get("plan") or resp.get("plan"),
         "current": current,
         "limit_day": limit_day,
         "remaining": remaining,
         "active": sub.get("active"),
+        "cached": False,
     }
 
 

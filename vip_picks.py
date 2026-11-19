@@ -1910,6 +1910,8 @@ def _compute_slate(sport: str, league_id: Optional[int], reuse: bool = True) -> 
 
 
 def _schedule_refresh(sport: str, league_id: Optional[int], key: str):
+    if not fm.background_fetches_allowed():
+        return
     with _cache_lock:
         if key in _refreshing or key in _inflight:
             return
@@ -1927,6 +1929,108 @@ def _schedule_refresh(sport: str, league_id: Optional[int], key: str):
     threading.Thread(target=_run, name=f"vip-refresh-{key[-24:]}", daemon=True).start()
 
 
+def _history_rows_today() -> list[dict]:
+    try:
+        from vip_history import fetch_rows
+        today = _today()
+        rows = fetch_rows(limit=500, only_pending=False)
+        return [r for r in rows if str(r.get("pick_date") or "")[:10] == today]
+    except Exception:
+        return []
+
+
+def _history_has_today() -> bool:
+    return bool(_history_rows_today())
+
+
+def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
+    """Serve today's already-published picks when quota is too tight to recompute."""
+    rows = _history_rows_today()
+    if not rows:
+        return None
+    if sport in {"football", "nba"}:
+        rows = [r for r in rows if (r.get("sport") or "").lower() == sport]
+    if league_id:
+        try:
+            lid = int(league_id)
+        except (TypeError, ValueError):
+            lid = None
+        if lid is not None:
+            rows = [r for r in rows if r.get("league_id") == lid]
+    if not rows:
+        return None
+    picks = []
+    fixtures = []
+    seen_fx = set()
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            0 if r.get("maxima_confianza") else 1,
+            -(int(r.get("confidence") or 0)),
+        ),
+    )
+    limit = 5
+    for r in ranked[:limit]:
+        raw = r.get("raw") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        picks.append({
+            "sport": r.get("sport"),
+            "market": r.get("market"),
+            "market_label": r.get("market_label"),
+            "selection": r.get("selection"),
+            "line": r.get("line"),
+            "avg_odd": r.get("odd"),
+            "confidence": r.get("confidence"),
+            "maxima_confianza": bool(r.get("maxima_confianza")),
+            "entity": r.get("entity"),
+            "entity_id": r.get("entity_id"),
+            "entity_side": r.get("entity_side"),
+            "match": r.get("match"),
+            "kickoff": r.get("kickoff"),
+            "league": r.get("league"),
+            "league_id": r.get("league_id"),
+            "fixture_id": r.get("fixture_id"),
+            "reason": raw.get("reason"),
+            "hit_rate": raw.get("hit_rate"),
+            "games": raw.get("games"),
+            "odds_verified": raw.get("odds_verified"),
+            "odds_value": raw.get("odds_value"),
+        })
+        match = r.get("match") or ""
+        if match and match not in seen_fx:
+            seen_fx.add(match)
+            parts = match.split(" vs ", 1)
+            fixtures.append({
+                "sport": r.get("sport"),
+                "match": match,
+                "home": parts[0] if parts else match,
+                "away": parts[1] if len(parts) > 1 else "",
+                "kickoff": r.get("kickoff"),
+                "league": r.get("league"),
+            })
+    return {
+        "date": _today(),
+        "window": "today",
+        "timezone": "America/Bogota",
+        "sport": sport,
+        "league": league_id,
+        "fixtures": fixtures,
+        "picks": picks,
+        "ai_explained": False,
+        "empty_reason": None,
+        "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
+        "cached": True,
+        "from_history": True,
+        "generated_at": datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
 def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict:
     sport = (sport or "all").lower()
     if sport in {"football", "futbol", "fútbol"}:
@@ -1936,12 +2040,22 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
     today = _today()
     key = _cache_key(sport, league_id, today, "auto")
     found = _cache_lookup(key, allow_stale=True)
+    remaining = fm.quota_remaining()
     if found:
         out = copy.deepcopy(found["data"])
         out["cached"] = True
-        if found.get("stale"):
+        if found.get("stale") and (remaining is None or remaining >= fm.QUOTA_SKIP_BACKGROUND):
             _schedule_refresh(sport, league_id, key)
         return out
+    if remaining is not None and remaining < fm.QUOTA_CACHE_ONLY:
+        hist = _slate_from_history(sport, league_id)
+        if hist:
+            return hist
+        raise RuntimeError("Cuota diaria casi agotada; se sirve solo la caché.")
+    if remaining is not None and remaining < fm.QUOTA_SKIP_BACKGROUND:
+        hist = _slate_from_history(sport, league_id)
+        if hist:
+            return hist
     return _compute_slate(sport, league_id, reuse=True)
 
 
@@ -1968,50 +2082,83 @@ def warm_picks_cache(force: bool = False) -> dict:
         "running": True,
     })
     report = {"ok": [], "skipped": [], "errors": []}
-
-    def _one(sport: str, league_id: Optional[int]):
-        key = _cache_key(sport, league_id, _today(), "auto")
-        found = _cache_lookup(key, allow_stale=False)
-        if found and not force:
-            return "skipped", f"{sport}:{league_id or 'all'}"
-        _compute_slate(sport, league_id, reuse=True)
-        return "ok", f"{sport}:{league_id or 'all'}"
-
-    # Todos first: NBA + the combined football slate, then assemble "all".
-    # Individual leagues follow, two at a time, to stay within typical
-    # API-Football Pro per-minute limits and share fixture work.
-    with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
-        futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in (("nba", None), ("football", None))}
-        for fut in as_completed(futs):
-            try:
-                kind, label = fut.result()
-                report[kind].append(label)
-            except Exception as exc:
-                s, lid = futs[fut]
-                report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
+    fm.set_request_mode("background")
     try:
-        kind, label = _one("all", None)
-        report[kind].append(label)
+        remaining = fm.quota_remaining(refresh=True)
+        tight = remaining is not None and remaining < 2000
+        if remaining is not None and remaining < fm.QUOTA_SKIP_BACKGROUND:
+            report["skipped"].append(f"quota:{remaining}")
+            print(f"HBA-QUOTA skip warmup remaining={remaining}", flush=True)
+            return report
+        # A full 12-league 15-game re-warm would blow a tight remaining budget,
+        # especially after a deploy wipes /tmp caches. If today's slate already
+        # exists locally or in history, skip the rebuild.
+        if tight:
+            force = False
+            if _has_today_slate() or _history_has_today():
+                report["skipped"].append(f"tight-quota:{remaining}")
+                print(f"HBA-QUOTA skip full warmup, serve cache/history remaining={remaining}", flush=True)
+                return report
+
+        fm.begin_call_cycle("warmup", cap=fm.CYCLE_CALL_CAP)
+
+        def _one(sport: str, league_id: Optional[int]):
+            if not fm.cycle_budget_left() or not fm.background_fetches_allowed():
+                return "skipped", f"{sport}:{league_id or 'all'}:quota"
+            key = _cache_key(sport, league_id, _today(), "auto")
+            found = _cache_lookup(key, allow_stale=False)
+            if found and not force:
+                return "skipped", f"{sport}:{league_id or 'all'}"
+            _compute_slate(sport, league_id, reuse=True)
+            return "ok", f"{sport}:{league_id or 'all'}"
+
+        # Core slates only first: NBA + combined football + Todos.
+        with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
+            futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in (("nba", None), ("football", None))}
+            for fut in as_completed(futs):
+                try:
+                    kind, label = fut.result()
+                    report[kind].append(label)
+                except Exception as exc:
+                    s, lid = futs[fut]
+                    report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
+        try:
+            kind, label = _one("all", None)
+            report[kind].append(label)
+        except Exception as exc:
+            report["errors"].append(f"all:{type(exc).__name__}")
+        remaining_now = fm.quota_remaining()
+        # Per-league slates are optional and were the long-running quota burn.
+        skip_leagues = (
+            tight
+            or not fm.cycle_budget_left()
+            or (remaining_now is not None and remaining_now < 2000)
+        )
+        if not skip_leagues:
+            rest = [("football", lid) for lid in ALL_LEAGUE_IDS]
+            with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
+                futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in rest}
+                for fut in as_completed(futs):
+                    try:
+                        kind, label = fut.result()
+                        report[kind].append(label)
+                    except Exception as exc:
+                        s, lid = futs[fut]
+                        report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
+        else:
+            report["skipped"].append("per-league:quota")
     except Exception as exc:
-        report["errors"].append(f"all:{type(exc).__name__}")
-    rest = [("football", lid) for lid in ALL_LEAGUE_IDS]
-    with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
-        futs = {pool.submit(_one, s, lid): (s, lid) for s, lid in rest}
-        for fut in as_completed(futs):
-            try:
-                kind, label = fut.result()
-                report[kind].append(label)
-            except Exception as exc:
-                s, lid = futs[fut]
-                report["errors"].append(f"{s}:{lid or 'all'}:{type(exc).__name__}")
-    LAST_WARMUP.update({
-        "seconds": round(time.time() - started, 1),
-        "finished_at": datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M"),
-        "ok": len(report["ok"]),
-        "skipped": len(report["skipped"]),
-        "errors": len(report["errors"]),
-        "running": False,
-    })
+        report["errors"].append(type(exc).__name__)
+    finally:
+        fm.end_call_cycle()
+        LAST_WARMUP.update({
+            "seconds": round(time.time() - started, 1),
+            "finished_at": datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M"),
+            "ok": len(report["ok"]),
+            "skipped": len(report["skipped"]),
+            "errors": len(report["errors"]),
+            "running": False,
+        })
     return report
 
 
@@ -2046,12 +2193,11 @@ def _has_today_slate() -> bool:
 def _grade_on_wake():
     """Grade leftover picks as soon as the process wakes, without waiting for warmup."""
     try:
+        if not fm.background_fetches_allowed():
+            return None
         from vip_history import grade_pending
         grade_pending()
-        yesterday = (datetime.now(BOGOTA).date() - timedelta(days=1)).isoformat()
-        # Second pass if yesterday still has pending rows after results landed.
-        grade_pending()
-        return yesterday
+        return (datetime.now(BOGOTA).date() - timedelta(days=1)).isoformat()
     except Exception:
         return None
 
@@ -2095,10 +2241,18 @@ def start_picks_background():
             # If the process slept through midnight, missing_today forces an
             # immediate compute on any wake.
             daytime = 7 <= now.hour <= 23
+            remaining = fm.quota_remaining()
+            allow_bg = remaining is None or remaining >= fm.QUOTA_SKIP_BACKGROUND
+            # Daytime 45-minute refreshes stay on when quota is healthy, but
+            # never force a full rebuild if remaining is under 2000.
+            force = allow_bg and ((not first and daytime) or new_day or morning or missing_today)
+            if remaining is not None and remaining < 2000:
+                force = False
             try:
-                warm_picks_cache(
-                    force=(not first and daytime) or new_day or morning or missing_today
-                )
+                if allow_bg:
+                    warm_picks_cache(force=force)
+                else:
+                    print(f"HBA-QUOTA skip background loop remaining={remaining}", flush=True)
                 if new_day or missing_today or last_forced_date is None:
                     last_forced_date = _today()
                 if morning:
@@ -2106,10 +2260,11 @@ def start_picks_background():
             except Exception:
                 pass
             try:
-                from vip_history import grade_pending
-                grade_pending()
-                if datetime.now(BOGOTA).hour >= 22:
+                if allow_bg:
+                    from vip_history import grade_pending
                     grade_pending()
+                    if datetime.now(BOGOTA).hour >= 22 and fm.background_fetches_allowed():
+                        grade_pending()
             except Exception:
                 pass
             first = False

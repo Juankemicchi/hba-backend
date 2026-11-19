@@ -28,6 +28,36 @@ VOID_FOOTBALL = {"CANC", "ABD", "AWD", "WO", "PST"}
 YES_WORDS = {"yes", "si", "sí", "s", "true", "1"}
 NO_WORDS = {"no", "n", "false", "0"}
 
+_grade_fixture_cache: dict = {}
+
+
+def _kickoff_dt(raw):
+    if raw is None or raw == "":
+        return None
+    s = str(raw).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BOGOTA)
+        return dt.astimezone(BOGOTA)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s[:19] if fmt.endswith("%S") else s[:16], fmt).replace(tzinfo=BOGOTA)
+        except ValueError:
+            continue
+    return None
+
+
+def _kickoff_has_passed(pick: dict) -> bool:
+    dt = _kickoff_dt(pick.get("kickoff"))
+    if dt is None:
+        return False
+    return dt <= datetime.now(BOGOTA)
+
 
 def _today() -> str:
     return datetime.now(BOGOTA).date().isoformat()
@@ -558,23 +588,20 @@ def publish_slate(data: dict) -> int:
 
 def _fetch_football_final(fixture_id):
     fid = int(fixture_id)
+    cached = _grade_fixture_cache.get(fid)
+    if cached is not None:
+        return cached
     data = fm.api_get("/fixtures", {"id": fid}, ttl=15 * 60)
     item = (data.get("response") or [None])[0]
     status = (((item or {}).get("fixture") or {}).get("status") or {}).get("short") or ""
-    if str(status).upper() not in FINISHED_FOOTBALL | VOID_FOOTBALL:
-        data = fm.api_get("/fixtures", {"id": fid}, ttl=15 * 60, force=True)
-        item = (data.get("response") or [None])[0]
-        status = (((item or {}).get("fixture") or {}).get("status") or {}).get("short") or ""
+    status = str(status).upper()
     stats_resp = []
-    if str(status).upper() in FINISHED_FOOTBALL:
-        # Always refresh statistics for a finished match if the cache might
-        # still hold an empty pre-game payload.
-        stats = fm.api_get("/fixtures/statistics", {"fixture": fid}, ttl=15 * 60)
+    if status in FINISHED_FOOTBALL:
+        stats = fm.api_get("/fixtures/statistics", {"fixture": fid}, ttl=fs.CACHE_TTL_FIXTURE)
         stats_resp = stats.get("response") or []
-        if not stats_resp:
-            stats = fm.api_get("/fixtures/statistics", {"fixture": fid}, ttl=15 * 60, force=True)
-            stats_resp = stats.get("response") or []
-    return item, stats_resp
+    result = (item, stats_resp)
+    _grade_fixture_cache[fid] = result
+    return result
 
 
 def _nba_row_for_pick(pick: dict) -> Optional[dict]:
@@ -634,6 +661,8 @@ def grade_row(row: dict) -> dict:
     sport = (row.get("sport") or "").lower()
     pick = dict(row)
     if sport in {"football", "futbol", "fútbol"}:
+        if not _kickoff_has_passed(pick):
+            return {"result": "pendiente", "note": "Kickoff pendiente", "actual": None, "units": None}
         fid = row.get("fixture_id")
         if not fid:
             return {"result": "pendiente", "note": "Sin fixture_id", "actual": None, "units": None}
@@ -646,28 +675,38 @@ def grade_row(row: dict) -> dict:
 
 
 def grade_pending(limit: int = 200) -> dict:
+    global _grade_fixture_cache
+    _grade_fixture_cache = {}
+    report = {"checked": 0, "graded": 0, "errors": 0, "skipped": 0, "results": {}}
+    if not fm.background_fetches_allowed():
+        report["skipped"] = "quota"
+        return report
     rows = fetch_rows(limit=limit, only_pending=True)
-    report = {"checked": 0, "graded": 0, "errors": 0, "results": {}}
-    for row in rows:
-        report["checked"] += 1
-        try:
-            graded = grade_row(row)
-        except Exception:
-            report["errors"] += 1
-            continue
-        result = (graded or {}).get("result") or "pendiente"
-        if result == "pendiente":
-            continue
-        ok = set_result(
-            row.get("pick_key"),
-            result,
-            graded.get("units"),
-            graded.get("note"),
-            graded.get("actual"),
-        )
-        if ok:
-            report["graded"] += 1
-            report["results"][result] = report["results"].get(result, 0) + 1
-        else:
-            report["errors"] += 1
+    fm.set_request_mode("background")
+    fm.begin_call_cycle("grade", cap=min(80, fm.CYCLE_CALL_CAP))
+    try:
+        for row in rows:
+            report["checked"] += 1
+            try:
+                graded = grade_row(row)
+            except Exception:
+                report["errors"] += 1
+                continue
+            result = (graded or {}).get("result") or "pendiente"
+            if result == "pendiente":
+                continue
+            ok = set_result(
+                row.get("pick_key"),
+                result,
+                graded.get("units"),
+                graded.get("note"),
+                graded.get("actual"),
+            )
+            if ok:
+                report["graded"] += 1
+                report["results"][result] = report["results"].get(result, 0) + 1
+            else:
+                report["errors"] += 1
+    finally:
+        fm.end_call_cycle()
     return report

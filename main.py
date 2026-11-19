@@ -22,6 +22,8 @@ from football_module import (
     get_leagues,
     get_standings,
     usage_snapshot,
+    set_request_mode,
+    quota_guard_snapshot,
     DEFAULT_LEAGUE,
 )
 from football_stats import (
@@ -63,6 +65,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _quota_request_mode(request, call_next):
+    path = request.url.path or ""
+    if path.startswith("/api/football") or path.startswith("/football") or path == "/analyze":
+        set_request_mode("user_stats")
+    elif path.startswith("/api/vip/picks"):
+        set_request_mode("user_picks")
+    else:
+        set_request_mode("background")
+    try:
+        return await call_next(request)
+    finally:
+        set_request_mode("background")
+
 
 # Placeholder key keeps import working if XAI_API_KEY is unset (local tests).
 # Calls are still guarded with os.getenv("XAI_API_KEY").
@@ -157,6 +175,11 @@ def health():
         quota = usage_snapshot()
     except Exception:
         quota = None
+    guard = None
+    try:
+        guard = quota_guard_snapshot()
+    except Exception:
+        guard = None
     return {
         "ok": True,
         "warmup_seconds": warm.get("seconds"),
@@ -164,6 +187,7 @@ def health():
         "warmup_started_at": warm.get("started_at"),
         "warmup_running": warm.get("running"),
         "football_quota": quota,
+        "quota_guard": guard,
     }
 
 
