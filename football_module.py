@@ -114,6 +114,35 @@ def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE, force: bool = 
     return data
 
 
+
+def usage_snapshot():
+    """Return today's API-Football request count vs the plan daily limit."""
+    try:
+        data = api_get("/status", {}, ttl=5 * 60)
+    except Exception:
+        return None
+    resp = data.get("response") or {}
+    if isinstance(resp, list):
+        resp = resp[0] if resp else {}
+    sub = resp.get("subscription") or {}
+    req = sub.get("requests") or resp.get("requests") or {}
+    current = req.get("current")
+    limit_day = req.get("limit_day") or req.get("limit_day") or req.get("limit")
+    remaining = None
+    try:
+        if current is not None and limit_day:
+            remaining = int(limit_day) - int(current)
+    except (TypeError, ValueError):
+        remaining = None
+    return {
+        "plan": sub.get("plan") or resp.get("plan"),
+        "current": current,
+        "limit_day": limit_day,
+        "remaining": remaining,
+        "active": sub.get("active"),
+    }
+
+
 def _map_team(item):
     team = item.get("team") or {}
     venue = item.get("venue") or {}

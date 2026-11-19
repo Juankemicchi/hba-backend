@@ -1,4 +1,10 @@
 import football_module as fm
+import copy
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 CACHE_TTL_FIXTURE = 30 * 24 * 60 * 60  # partidos terminados no cambian
 FINISHED = {"FT", "AET", "PEN"}
@@ -245,36 +251,46 @@ def search_entities(query: str, limit: int = 8):
     if len(q) < 2:
         return {"teams": [], "players": []}
 
-    teams = []
-    try:
-        data = fm.api_get("/teams", {"search": q}, ttl=fm.CACHE_TTL_STABLE)
-        for item in data.get("response") or []:
-            team = fm._map_team(item)
-            if team.get("id"):
-                teams.append(team)
-            if len(teams) >= limit:
-                break
-    except ValueError:
-        teams = []
+    def _search_teams():
+        found = []
+        try:
+            data = fm.api_get("/teams", {"search": q}, ttl=fm.CACHE_TTL_STABLE)
+            for item in data.get("response") or []:
+                team = fm._map_team(item)
+                if team.get("id"):
+                    found.append(team)
+                if len(found) >= limit:
+                    break
+        except ValueError:
+            return []
+        return found
 
-    players = []
-    try:
-        data = fm.api_get("/players/profiles", {"search": q}, ttl=fm.CACHE_TTL_STABLE)
-        for item in data.get("response") or []:
-            p = item.get("player") or item
-            if not p.get("id"):
-                continue
-            players.append({
-                "id": p.get("id"),
-                "name": p.get("name"),
-                "fullname": " ".join(x for x in [p.get("firstname"), p.get("lastname")] if x) or p.get("name"),
-                "age": p.get("age"),
-                "photo": p.get("photo"),
-                "position": p.get("position") or p.get("pos"),
-                "nationality": p.get("nationality"),
-            })
-    except ValueError:
-        players = []
+    def _search_players():
+        found = []
+        try:
+            data = fm.api_get("/players/profiles", {"search": q}, ttl=fm.CACHE_TTL_STABLE)
+            for item in data.get("response") or []:
+                p = item.get("player") or item
+                if not p.get("id"):
+                    continue
+                found.append({
+                    "id": p.get("id"),
+                    "name": p.get("name"),
+                    "fullname": " ".join(x for x in [p.get("firstname"), p.get("lastname")] if x) or p.get("name"),
+                    "age": p.get("age"),
+                    "photo": p.get("photo"),
+                    "position": p.get("position") or p.get("pos"),
+                    "nationality": p.get("nationality"),
+                })
+        except ValueError:
+            return []
+        return found
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ft = pool.submit(_search_teams)
+        fp = pool.submit(_search_players)
+        teams = ft.result()
+        players = fp.result()
 
     ql = q.lower()
     import re
@@ -433,12 +449,63 @@ def _enrich_team_row(row, team_id):
     return row
 
 
+
+_BOGOTA = ZoneInfo("America/Bogota")
+_props_cache = {}
+_props_lock = threading.Lock()
+_PROPS_TTL = 30 * 60
+_ENRICH_WORKERS = 4
+
+
+def _today_bogota() -> str:
+    return datetime.now(_BOGOTA).date().isoformat()
+
+
+def _props_get(key):
+    with _props_lock:
+        item = _props_cache.get(key)
+        if item and time.time() - item["ts"] < _PROPS_TTL:
+            return copy.deepcopy(item["data"])
+    return None
+
+
+def _props_set(key, data):
+    with _props_lock:
+        _props_cache[key] = {"ts": time.time(), "data": data}
+        if len(_props_cache) > 400:
+            oldest = sorted(_props_cache.items(), key=lambda kv: kv[1]["ts"])[:80]
+            for k, _ in oldest:
+                _props_cache.pop(k, None)
+
+
+def _enrich_rows(rows, team_id):
+    if not rows:
+        return
+    workers = min(_ENRICH_WORKERS, len(rows))
+    if workers <= 1:
+        for row in rows:
+            _enrich_team_row(row, team_id)
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda row: _enrich_team_row(row, team_id), rows))
+
+
 def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="all",
                        opponent=None, opponent_id=None, lines=None, season=None, market=None):
     venue = (venue or "all").lower()
     if venue not in ("all", "home", "away"):
         venue = "all"
     last_n = _clamp_last_n(last_n)
+
+    cache_key = None
+    if team_id:
+        cache_key = "|".join([
+            "team", str(int(team_id)), str(league or ""), str(last_n),
+            venue or "all", str(opponent_id or opponent or ""), _today_bogota(),
+        ])
+        cached = _props_get(cache_key)
+        if cached is not None:
+            return cached
 
     found = None
     if team_id:
@@ -464,8 +531,7 @@ def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="a
     team_id = found["id"]
     info, season = fm._resolve_team_league(found, league, season)
     rows = _finished_fixtures(team_id, last_n, venue)
-    for row in rows:
-        _enrich_team_row(row, team_id)
+    _enrich_rows(rows, team_id)
 
     merged_lines = dict(DEFAULT_LINES_TEAM)
     if isinstance(lines, dict):
@@ -506,7 +572,7 @@ def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="a
         except ValueError:
             h2h = None
 
-    return {
+    result = {
         "team": found,
         "league": info,
         "season": season,
@@ -521,6 +587,9 @@ def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="a
         "h2h": (h2h.get("matches") if h2h else None),
         "lines": merged_lines,
     }
+    if cache_key:
+        _props_set(cache_key, result)
+    return result
 
 
 
@@ -560,7 +629,7 @@ def _season_finished_fixtures(team_id, season, venue="all"):
             "opponent_logo": opponent_logo,
             "goals_for": gf,
             "goals_against": ga,
-            "goals_total": (None if goals_for is None or goals_against is None else gf + ga),
+            "goals_total": (None if gf is None or ga is None else gf + ga),
             "btts": 1 if gf > 0 and ga > 0 else 0,
             "result": result,
             "score": f"{int(gf)}-{int(ga)}",
@@ -769,6 +838,15 @@ def _season_player_totals(player_id, season, team_id=None, league=None):
 def analyze_player_props(player=None, player_id=None, team=None, team_id=None, league=None,
                          last_n=10, lines=None, season=None, market=None):
     last_n = _clamp_last_n(last_n)
+    cache_key = None
+    if player_id or player:
+        cache_key = "|".join([
+            "player", str(player_id or ""), str(player or ""), str(team_id or team or ""),
+            str(league or ""), str(last_n), _today_bogota(),
+        ])
+        cached = _props_get(cache_key)
+        if cached is not None:
+            return cached
     prof = _lookup_player(player, player_id)
     if not prof or not prof.get("id"):
         return None
@@ -809,23 +887,33 @@ def analyze_player_props(player=None, player_id=None, team=None, team_id=None, l
     rows = []
     pos = prof.get("position") or (season_totals or {}).get("position")
     scanned = 0
-    for fx in fixtures:
-        if scanned >= 40:
-            break
-        rec = _player_from_fixture(fx["fixture_id"], player_id)
-        scanned += 1
-        if not rec or rec.get("dnp"):
-            continue
-        if rec.get("position"):
-            pos = rec.get("position")
-        row = dict(fx)
-        row.update({k: rec.get(k) for k in (
-            "minutes", "position", "rating", "shots", "shots_on_target",
-            "goals", "assists", "saves", "fouls_committed", "fouls_drawn",
-        )})
-        rows.append(row)
-        if len(rows) >= last_n:
-            break
+    remaining = list(fixtures[:40])
+    while remaining and len(rows) < last_n and scanned < 40:
+        batch = remaining[:8]
+        remaining = remaining[8:]
+        recs = {}
+        with ThreadPoolExecutor(max_workers=min(_ENRICH_WORKERS, len(batch))) as pool:
+            futs = {pool.submit(_player_from_fixture, fx["fixture_id"], player_id): fx for fx in batch}
+            for fut, fx in futs.items():
+                try:
+                    recs[fx["fixture_id"]] = fut.result()
+                except Exception:
+                    recs[fx["fixture_id"]] = None
+        for fx in batch:
+            scanned += 1
+            rec = recs.get(fx["fixture_id"])
+            if not rec or rec.get("dnp"):
+                continue
+            if rec.get("position"):
+                pos = rec.get("position")
+            row = dict(fx)
+            row.update({k: rec.get(k) for k in (
+                "minutes", "position", "rating", "shots", "shots_on_target",
+                "goals", "assists", "saves", "fouls_committed", "fouls_drawn",
+            )})
+            rows.append(row)
+            if len(rows) >= last_n:
+                break
 
     merged_lines = dict(DEFAULT_LINES_PLAYER)
     if isinstance(lines, dict):
@@ -855,7 +943,7 @@ def analyze_player_props(player=None, player_id=None, team=None, team_id=None, l
     if prof.get("position") is None and pos:
         prof["position"] = pos
 
-    return {
+    result = {
         "player": prof,
         "team": team_info,
         "season": season,
@@ -870,3 +958,6 @@ def analyze_player_props(player=None, player_id=None, team=None, team_id=None, l
         "season_totals": season_totals,
         "per_match": bool(rows),
     }
+    if cache_key:
+        _props_set(cache_key, result)
+    return result

@@ -1,5 +1,10 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+try:
+    from fastapi.responses import ORJSONResponse
+except Exception:  # pragma: no cover
+    ORJSONResponse = None
 from nba_module import (
     analyze_prop,
     search_nba,
@@ -16,6 +21,7 @@ from football_module import (
     get_squad,
     get_leagues,
     get_standings,
+    usage_snapshot,
     DEFAULT_LEAGUE,
 )
 from football_stats import (
@@ -47,8 +53,9 @@ import threading
 import requests
 from openai import OpenAI
 
-app = FastAPI(title="HBA Backend")
+app = FastAPI(title="HBA Backend", default_response_class=ORJSONResponse) if ORJSONResponse else FastAPI(title="HBA Backend")
 
+app.add_middleware(GZipMiddleware, minimum_size=400)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,6 +70,29 @@ client = OpenAI(
     api_key=os.getenv("XAI_API_KEY") or "missing-xai-key",
     base_url="https://api.x.ai/v1",
 )
+
+GROK_FAST_MODEL = os.getenv("GROK_FAST_MODEL", "grok-4.3")
+
+
+def _grok_complete(messages, max_tokens=280, temperature=0.7):
+    """Fast non-reasoning completion for insight/chat-style text. Falls back to grok-4."""
+    try:
+        return client.chat.completions.create(
+            model=GROK_FAST_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra_body={"reasoning_effort": "none"},
+        )
+    except Exception:
+        return client.chat.completions.create(
+            model="grok-4",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+
 
 BIGBALLS_KEY = os.getenv("BIGBALLS_API_KEY", "")
 HEADERS = {"Authorization": f"Bearer {BIGBALLS_KEY}"}
@@ -122,10 +152,18 @@ def root():
 @app.get("/health")
 def health():
     warm = get_warmup_status()
+    quota = None
+    try:
+        quota = usage_snapshot()
+    except Exception:
+        quota = None
     return {
         "ok": True,
         "warmup_seconds": warm.get("seconds"),
         "warmup_at": warm.get("finished_at"),
+        "warmup_started_at": warm.get("started_at"),
+        "warmup_running": warm.get("running"),
+        "football_quota": quota,
     }
 
 
@@ -169,11 +207,10 @@ Datos del jugador:
 Genera un análisis de 4 a 6 líneas que incluya promedio vs línea, consistencia, riesgo y conclusión. Sé directo y profesional."""
 
     try:
-        response = client.chat.completions.create(
-            model="grok-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            temperature=0.75
+        response = _grok_complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=240,
+            temperature=0.75,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -237,11 +274,10 @@ Lesionados: {_fmt_injuries(ctx.get('injuries'))}
 Genera un análisis de 4 a 6 líneas sobre el momento del equipo, consistencia, bajas importantes, nivel de riesgo para apostar y una conclusión clara. Sé directo y profesional. No uses listas numeradas."""
 
     try:
-        response = client.chat.completions.create(
-            model="grok-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=350,
-            temperature=0.75
+        response = _grok_complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=280,
+            temperature=0.75,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -277,11 +313,10 @@ Historial H2H (más reciente primero):
 Genera un análisis de 4 a 6 líneas que compare momento de ambos equipos, el historial, bajas y una conclusión clara para el mercado 1X2 o goles. Sé directo y profesional. No uses listas numeradas."""
 
     try:
-        response = client.chat.completions.create(
-            model="grok-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.75
+        response = _grok_complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.75,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -465,18 +500,17 @@ CONFIANZA: <1-5>/5
 Sé directo. Menciona consistencia, riesgo y si el promedio sostiene la línea. Si el mercado es Ambos anotan, usa SÍ o NO (no over/under)."""
 
     try:
-        response = client.chat.completions.create(
-            model="grok-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=350,
-            temperature=0.6
+        response = _grok_complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=280,
+            temperature=0.6,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"Error al generar análisis: {str(e)}"
 
 
-INSIGHT_TTL = 12 * 60
+INSIGHT_TTL = 6 * 60 * 60
 _insight_cache = {}
 _insight_inflight = {}
 _insight_mutex = threading.Lock()
@@ -632,10 +666,9 @@ Sé directo. Menciona consistencia, riesgo y si los datos sostienen esta línea.
     if not os.getenv("XAI_API_KEY"):
         return f"No hay clave de IA configurada. Mercado {market_label}, línea {line_txt}."
     try:
-        response = client.chat.completions.create(
-            model="grok-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=350,
+        response = _grok_complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=280,
             temperature=0.6,
         )
         return (response.choices[0].message.content or "").strip()
