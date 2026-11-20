@@ -1,3 +1,4 @@
+from typing import Optional
 import os
 import json
 import logging
@@ -39,7 +40,7 @@ _quota_state = {
 }
 _request_mode = threading.local()
 _cycle_lock = threading.Lock()
-_active_cycle = None
+_active_cycles: dict = {}
 
 
 def set_request_mode(mode: str):
@@ -52,9 +53,10 @@ def get_request_mode() -> str:
 
 
 def begin_call_cycle(name: str, cap: int = CYCLE_CALL_CAP):
-    global _active_cycle
+    """Start a named call budget. Cycles can overlap (warmup + grading); every live
+    API call counts against every active cycle, so one cycle can never erase another's cap."""
     with _cycle_lock:
-        _active_cycle = {
+        _active_cycles[name] = {
             "name": name,
             "cap": int(cap),
             "calls": 0,
@@ -63,11 +65,12 @@ def begin_call_cycle(name: str, cap: int = CYCLE_CALL_CAP):
         }
 
 
-def end_call_cycle():
-    global _active_cycle
+def end_call_cycle(name: Optional[str] = None):
     with _cycle_lock:
-        cycle = _active_cycle
-        _active_cycle = None
+        if name is None and _active_cycles:
+            # Backward compatible: end the most recently started cycle.
+            name = max(_active_cycles.values(), key=lambda c: c["started"])["name"]
+        cycle = _active_cycles.pop(name, None) if name else None
     if not cycle:
         return None
     with _quota_lock:
@@ -91,31 +94,30 @@ def end_call_cycle():
 
 def last_cycle_snapshot():
     with _cycle_lock:
-        if _active_cycle:
-            return dict(_active_cycle)
+        if _active_cycles:
+            return {k: dict(v) for k, v in _active_cycles.items()}
     return None
 
 
 def cycle_budget_left() -> bool:
     with _cycle_lock:
-        cycle = _active_cycle
-        if not cycle:
-            return True
-        return cycle["calls"] < cycle["cap"]
+        return all(c["calls"] < c["cap"] for c in _active_cycles.values())
 
 
 def _note_cycle_skip():
     with _cycle_lock:
-        if _active_cycle:
-            _active_cycle["skipped"] += 1
+        for c in _active_cycles.values():
+            c["skipped"] += 1
 
 
 def _note_cycle_call():
     with _cycle_lock:
-        if _active_cycle:
-            _active_cycle["calls"] += 1
-            return _active_cycle["calls"], _active_cycle["cap"], _active_cycle["name"]
-    return None, None, None
+        if not _active_cycles:
+            return None, None, None
+        for c in _active_cycles.values():
+            c["calls"] += 1
+        tight = min(_active_cycles.values(), key=lambda c: c["cap"] - c["calls"])
+        return tight["calls"], tight["cap"], tight["name"]
 
 
 def _remember_quota(current, limit_day, remaining=None):

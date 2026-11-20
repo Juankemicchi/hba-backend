@@ -744,5 +744,5 @@ def grade_pending(limit: int = 200) -> dict:
             else:
                 report["errors"] += 1
     finally:
-        fm.end_call_cycle()
+        fm.end_call_cycle("grade")
     return report

@@ -2391,7 +2391,7 @@ def warm_picks_cache(force: bool = False) -> dict:
     except Exception as exc:
         report["errors"].append(type(exc).__name__)
     finally:
-        fm.end_call_cycle()
+        fm.end_call_cycle("warmup")
         LAST_WARMUP.update({
             "seconds": round(time.time() - started, 1),
             "finished_at": datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M"),
