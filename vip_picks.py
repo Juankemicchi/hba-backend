@@ -245,22 +245,54 @@ def _cache_get(key: str):
     return found["data"] if found else None
 
 
-def _ready_to_publish(data: dict) -> bool:
-    """v9: freeze the daily football card only after the full scan finished, or when
-    the first match is close (so a quota-truncated first pass never locks a thin card)."""
+def _publishable_slate(data: dict) -> Optional[dict]:
+    """v9: freeze the full football card only after the scan finished. While the scan is
+    still partial (quota cycle ran out), publish only picks that kick off within 2h,
+    so they are not lost, and keep the other cap slots for the complete scan."""
     if data.get("sport") != "football":
-        return True
+        return data
     cov = data.get("coverage") or {}
     if not cov or cov.get("complete", True):
-        return True
-    first = _parse_kickoff(cov.get("first_kickoff"))
-    if first is None:
-        return True
-    return first - datetime.now(BOGOTA) <= timedelta(hours=2)
+        return data
+    soon = []
+    now = datetime.now(BOGOTA)
+    for p in data.get("picks") or []:
+        dt = _parse_kickoff(p.get("kickoff"))
+        if dt is not None and dt - now <= timedelta(hours=2):
+            soon.append(p)
+    if not soon:
+        return None
+    out = dict(data)
+    out["picks"] = soon
+    return out
+
+
+def _log_slate(data: dict):
+    """Owner-only ops line in the Render log: what the slate contains and how far the scan got."""
+    try:
+        if data.get("league") not in (None, "", 0):
+            return
+        rows = []
+        for p in data.get("picks") or []:
+            rows.append(
+                f"{p.get('kickoff')}|{p.get('match')}|{p.get('market_label')}|{p.get('selection')}"
+                f" {p.get('line') if p.get('line') is not None else ''}|odd={p.get('avg_odd')}"
+                f"|conf={p.get('confidence')}|max={bool(p.get('maxima_confianza'))}"
+                f"|edge={p.get('edge')}|top3={p.get('top3_rank')}"
+            )
+        print(
+            f"HBA-SLATE sport={data.get('sport')} window={data.get('window')} n={len(rows)} "
+            f"coverage={json.dumps(data.get('coverage'), ensure_ascii=False)} nba_diag={json.dumps(data.get('diag'), ensure_ascii=False)} "
+            + " || ".join(rows),
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 def _cache_set(key: str, data: dict):
     item = {"ts": time.time(), "data": data}
+    _log_slate(data)
     with _cache_lock:
         _memory_cache[key] = item
         try:
@@ -277,10 +309,12 @@ def _cache_set(key: str, data: dict):
     # History = the official daily card only: main football (all leagues) and NBA
     # slates for today. Per-league and "upcoming" previews are never published.
     if data.get("league") in (None, "", 0) and data.get("window", "today") == "today" \
-            and data.get("sport") in {"football", "nba"} and _ready_to_publish(data):
+            and data.get("sport") in {"football", "nba"}:
         try:
             from vip_history import publish_slate
-            publish_slate(data)
+            pub = _publishable_slate(data)
+            if pub:
+                publish_slate(pub)
         except Exception:
             pass
 
@@ -2175,16 +2209,20 @@ def _build_nba() -> dict:
     games = _trim_fixtures(games, NBA_MAX_FIXTURES)
     # Player props are the NBA daily product. Team totals remain a fallback only.
     candidates = nprops.collect_nba_prop_candidates(games)
+    diag = {"games": len(games), "candidates": len(candidates)}
     # v9: an Under 0.5 (e.g. a center's 0 triples) is not a real bettable line:
     # books price it at ~1.10 or do not offer it. Drop it.
     candidates = [c for c in candidates if not _nba_trivial_under(c)]
     # Do not issue picks for games that already tipped off.
     candidates = [c for c in candidates if _nba_not_started(c)]
+    diag["after_filters"] = len(candidates)
     pool = _rank_nba_props(candidates, 12, keep_score=True)
     grok_lines = {"attempted": False, "ok": False, "reason": "no_picks"}
     if pool:
         pool, grok_lines = nprops.enrich_props_with_grok_lines(pool)
         pool = [p for p in pool if not p.get("book_conflict")]
+    diag["pool"] = len(pool)
+    diag["grok_lines"] = grok_lines
     picks = _rank_nba_props(pool, NBA_DAILY_CAP)
     for pick in picks:
         pick["kickoff"] = _kickoff_label(pick.get("kickoff"))
@@ -2226,6 +2264,7 @@ def _build_nba() -> dict:
         "sport": "nba",
         "fixtures": _public_fixtures(games, "nba"),
         "picks": picks,
+        "diag": diag,
         "ai_explained": bool(ai and picks),
         "empty_reason": empty,
         "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
