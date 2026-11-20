@@ -43,6 +43,7 @@ from vip_access import (
 )
 from vip_picks import list_vip_competitions, get_daily_picks, start_picks_background, get_warmup_status
 from vip_history import list_history
+from app_notifications import app_notifications_state
 from vip_slip import SlipRequest, analyze_slip
 from vip_chat import ChatRequest, vip_chat
 from pydantic import BaseModel
@@ -877,6 +878,17 @@ class AdminVipRequest(BaseModel):
     email: Optional[str] = None
     user_id: Optional[str] = None
     is_vip: bool = True
+
+
+@app.get("/api/app/notifications")
+def app_notifications():
+    """Public, quota-free state for the Android app's notification poller."""
+    try:
+        return app_notifications_state()
+    except Exception:
+        return {"ok": False, "date": None, "slate_id": None, "picks_count": 0,
+                "max_confidence_count": 0, "history_latest_date": None,
+                "history_graded_count": 0, "history_won": 0, "history_lost": 0}
 
 
 @app.get("/api/vip/config")
