@@ -99,6 +99,22 @@ def last_cycle_snapshot():
     return None
 
 
+_skip_counter = {"n": 0}
+
+
+def skip_counter() -> int:
+    """Monotonic count of API calls that the guard blocked (empty/stale payload served)."""
+    return _skip_counter["n"]
+
+
+def cycle_calls_left():
+    """Calls left in the tightest active cycle, or None when no cycle is active."""
+    with _cycle_lock:
+        if not _active_cycles:
+            return None
+        return min(c["cap"] - c["calls"] for c in _active_cycles.values())
+
+
 def cycle_budget_left() -> bool:
     with _cycle_lock:
         return all(c["calls"] < c["cap"] for c in _active_cycles.values())
@@ -300,6 +316,8 @@ def api_get(path: str, params: dict, ttl: int = CACHE_TTL_STABLE, force: bool = 
     if blocked:
         stale = _cache_get(key, allow_stale=True)
         _note_cycle_skip()
+        if stale is None:
+            _skip_counter["n"] += 1
         if stale is not None:
             try:
                 _raise_api_errors(stale)

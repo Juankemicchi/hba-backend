@@ -30,7 +30,12 @@ from openai import OpenAI
 BOGOTA = ZoneInfo("America/Bogota")
 SLATE_TTL = 45 * 60
 STALE_MAX = 12 * 60 * 60
-MAX_FIXTURES = 6
+MAX_FIXTURES = 6                # per-league slates (filters)
+ALL_MAX_ANALYZED = 16           # main card: fixtures fully analyzed (15-game venue samples)
+ALL_MAX_ODDS_PROBES = 30        # main card: odds lookups used to pre-screen fixtures
+FIXTURE_CALL_RESERVE = 45       # uncached calls one fixture may need; stop the cycle before it runs dry
+FIXTURE_LIST_TTL = 3 * 60 * 60  # whole-day fixture lists (kickoff + status re-checked locally)
+PICK_LEAD_MINUTES = 10          # never publish a pick for a match that starts in < 10 min
 NBA_MAX_FIXTURES = 12
 LAST_N = 15
 CACHE_FILE = Path(os.getenv("VIP_PICKS_CACHE_FILE", "/tmp/hba_vip_picks_cache.json"))
@@ -52,6 +57,8 @@ FOOTBALL_COMPETITIONS = [
 ]
 ALL_LEAGUE_IDS = [c["id"] for c in FOOTBALL_COMPETITIONS]
 
+# Extra odds-rich leagues scanned for the main card only (not shown as filters).
+EXTRA_SCAN_IDS = [3, 848, 88, 94, 40, 144, 203, 307, 98, 292, 11]
 # Modest default "all" set — popular + local. Still capped at MAX_FIXTURES.
 ALL_PRIORITY_IDS = [239, 71, 39, 140, 2, 135, 13]
 
@@ -122,7 +129,7 @@ def list_vip_competitions() -> dict:
     }
 
 
-CACHE_VERSION = "v8"
+CACHE_VERSION = "v9"
 
 
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
@@ -238,6 +245,20 @@ def _cache_get(key: str):
     return found["data"] if found else None
 
 
+def _ready_to_publish(data: dict) -> bool:
+    """v9: freeze the daily football card only after the full scan finished, or when
+    the first match is close (so a quota-truncated first pass never locks a thin card)."""
+    if data.get("sport") != "football":
+        return True
+    cov = data.get("coverage") or {}
+    if not cov or cov.get("complete", True):
+        return True
+    first = _parse_kickoff(cov.get("first_kickoff"))
+    if first is None:
+        return True
+    return first - datetime.now(BOGOTA) <= timedelta(hours=2)
+
+
 def _cache_set(key: str, data: dict):
     item = {"ts": time.time(), "data": data}
     with _cache_lock:
@@ -256,7 +277,7 @@ def _cache_set(key: str, data: dict):
     # History = the official daily card only: main football (all leagues) and NBA
     # slates for today. Per-league and "upcoming" previews are never published.
     if data.get("league") in (None, "", 0) and data.get("window", "today") == "today" \
-            and data.get("sport") in {"football", "nba"}:
+            and data.get("sport") in {"football", "nba"} and _ready_to_publish(data):
         try:
             from vip_history import publish_slate
             publish_slate(data)
@@ -498,22 +519,45 @@ def _collect_football_fixtures(league_id: Optional[int], dates_bogota: list[str]
         utc_dates.append(cursor.isoformat())
         cursor += timedelta(days=1)
     league_ids = [int(league_id)] if league_id else list(ids or ALL_PRIORITY_IDS)
+    order = {lid: i for i, lid in enumerate(league_ids)}
     fixtures = []
     seen = set()
-    for lid in league_ids:
-        for usd in utc_dates:
-            for fx in _fixtures_on_date(lid, usd):
-                bdate = _bogota_date(fx.get("kickoff") or fx.get("date"))
-                if bdate not in need:
-                    continue
-                fid = fx.get("fixture_id") or (fx.get("home"), fx.get("away"), fx.get("date"))
-                if fid in seen:
-                    continue
-                seen.add(fid)
-                fixtures.append(fx)
-        if league_id is None and len(fixtures) >= MAX_FIXTURES * 2:
-            break
+    for usd in utc_dates:
+        for fx in _all_fixtures_on_utc_date(usd):
+            if fx.get("league_id") not in order:
+                continue
+            bdate = _bogota_date(fx.get("kickoff") or fx.get("date"))
+            if bdate not in need:
+                continue
+            fid = fx.get("fixture_id") or (fx.get("home"), fx.get("away"), fx.get("date"))
+            if fid in seen:
+                continue
+            seen.add(fid)
+            fixtures.append(fx)
+    fixtures.sort(key=lambda fx: order.get(fx.get("league_id"), 999))
     return fixtures
+
+
+def _all_fixtures_on_utc_date(date_str: str) -> list[dict]:
+    """Every fixture worldwide on one UTC date (one API call, cached 3h).
+
+    v9: replaces one call per league per date, so scanning 20+ leagues costs 2 calls.
+    """
+    try:
+        data = fm.api_get("/fixtures", {"date": date_str}, ttl=FIXTURE_LIST_TTL)
+    except Exception:
+        return []
+    out = []
+    for item in data.get("response") or []:
+        lid = (item.get("league") or {}).get("id")
+        if lid is None:
+            continue
+        mapped = _map_fixture(item, lid)
+        status = (mapped.get("status") or "").upper()
+        if status in {"CANC", "PST", "ABD", "AWD", "WO"}:
+            continue
+        out.append(mapped)
+    return out
 
 
 _FINISHED_STATUS = {
@@ -538,6 +582,17 @@ def _upcoming_only(fixtures: list[dict]) -> list[dict]:
             continue
         keep.append(fx)
     return keep
+
+
+def _pickable(fx: dict) -> bool:
+    """A pick can only be issued before kickoff (not started, not live, not finished)."""
+    status = (fx.get("status") or "").upper()
+    if status and status not in {"NS", "TBD"}:
+        return False
+    dt = _parse_kickoff(fx.get("kickoff") or fx.get("date"))
+    if dt is None:
+        return False
+    return dt > datetime.now(BOGOTA) + timedelta(minutes=PICK_LEAD_MINUTES)
 
 
 def _trim_fixtures(fixtures: list[dict], limit: Optional[int] = None) -> list[dict]:
@@ -749,6 +804,7 @@ def _analyze_football_team(team_id: int, league_id: int, venue: Optional[str] = 
         hit = _team_hist.get(key)
         if hit is not None:
             return copy.deepcopy(hit)
+    skips_before = fm.skip_counter()
     try:
         data = fs.analyze_team_props(
             team_id=int(team_id),
@@ -757,6 +813,10 @@ def _analyze_football_team(team_id: int, league_id: int, venue: Optional[str] = 
             venue=venue or "all",
         )
     except Exception:
+        return None
+    if fm.skip_counter() > skips_before:
+        # The quota guard blocked part of this sample (empty stats). Never cache or
+        # score a truncated 15-game window; the next cycle completes it from cache.
         return None
     with _team_hist_lock:
         _team_hist[key] = data
@@ -1332,7 +1392,10 @@ def _picks_for_football_fixture(fx: dict) -> list[dict]:
             item = _fixture_picks_cache.get(fx_key)
             if item and time.time() - item.get("ts", 0) < SLATE_TTL:
                 return copy.deepcopy(item.get("data") or [])
+    skips_before = fm.skip_counter()
     result = _picks_for_football_fixture_compute(fx)
+    if fm.skip_counter() > skips_before:
+        return result
     if fx_key:
         with _fixture_picks_lock:
             _fixture_picks_cache[fx_key] = {"ts": time.time(), "data": copy.deepcopy(result)}
@@ -1369,12 +1432,14 @@ def _picks_for_football_fixture_compute(fx: dict) -> list[dict]:
     league_id = fx.get("league_id")
     if not home_id or not away_id or not league_id:
         return []
+    # v9: odds first (1 call). No bookmaker market = no value check = skip the
+    # ~35 calls of 15-game venue samples.
+    odds_index = get_fixture_odds(fx.get("fixture_id"))
+    if not odds_index:
+        return []
     home_a, home_fb = _venue_analysis(home_id, league_id, "home")
     away_a, away_fb = _venue_analysis(away_id, league_id, "away")
     if not home_a or not away_a:
-        return []
-    odds_index = get_fixture_odds(fx.get("fixture_id"))
-    if not odds_index:
         return []
 
     candidates = []
@@ -1950,10 +2015,49 @@ def _public_fixtures(fixtures: list[dict], sport: str) -> list[dict]:
     return out
 
 
+def _fixture_priority(fx: dict) -> tuple:
+    lid = fx.get("league_id")
+    tier = 0 if lid in ALL_LEAGUE_IDS else 1
+    dt = _parse_kickoff(fx.get("kickoff") or fx.get("date")) or datetime.max.replace(tzinfo=BOGOTA)
+    return (tier, dt)
+
+
+def _value_score(pick: dict) -> float:
+    try:
+        edge = float(pick.get("edge") or 0)
+    except (TypeError, ValueError):
+        edge = 0.0
+    try:
+        conf = int(pick.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0
+    try:
+        p_model = float(pick.get("model_prob") or 0)
+    except (TypeError, ValueError):
+        p_model = 0.0
+    return round(max(edge, 0.0) * conf + p_model * 0.01, 3)
+
+
+def _mark_top3(picks: list[dict]) -> list[dict]:
+    """Top 3 del día: strongest picks by edge x confidence. Labels stay honest:
+    only picks that pass _is_maxima_confianza carry maxima_confianza."""
+    for p in picks:
+        p.pop("top3_rank", None)
+        p["value_score"] = _value_score(p)
+    ranked = sorted(
+        picks,
+        key=lambda p: (-(p.get("value_score") or 0), -(int(p.get("confidence") or 0)),
+                       -(float(p.get("hit_rate") or 0))),
+    )
+    for i, p in enumerate(ranked[:3], start=1):
+        p["top3_rank"] = i
+    return picks
+
+
 def _build_football(league_id: Optional[int]) -> dict:
     today = _today()
     window = "today"
-    today_ids = None if league_id else ALL_LEAGUE_IDS
+    today_ids = None if league_id else (ALL_LEAGUE_IDS + [i for i in EXTRA_SCAN_IDS if i not in ALL_LEAGUE_IDS])
     fixtures = _upcoming_only(_collect_football_fixtures(league_id, [today], ids=today_ids))
     if not fixtures:
         # Preview only (never published to the history): tomorrow's games, one day
@@ -1961,30 +2065,85 @@ def _build_football(league_id: Optional[int]) -> dict:
         upcoming_days = [] if datetime.now(BOGOTA).hour < 7 else [
             (datetime.now(BOGOTA).date() + timedelta(days=1)).isoformat()
         ]
-        fixtures = _upcoming_only(_collect_football_fixtures(league_id, upcoming_days))
+        fixtures = _upcoming_only(_collect_football_fixtures(league_id, upcoming_days, ids=today_ids))
         if fixtures:
             window = "upcoming"
-    fixtures = _trim_fixtures(fixtures)
+    # v9: only matches that have not kicked off can produce picks.
+    pickable = [fx for fx in fixtures if _pickable(fx)]
+    if league_id:
+        pickable = _trim_fixtures(pickable)
+        max_analyzed, max_probes = MAX_FIXTURES, MAX_FIXTURES * 2
+        shown = _trim_fixtures(fixtures)
+    else:
+        pickable = sorted(pickable, key=_fixture_priority)
+        max_analyzed, max_probes = ALL_MAX_ANALYZED, ALL_MAX_ODDS_PROBES
+        shown = _trim_fixtures(fixtures, 40)
     candidates = []
-    for fx in fixtures:
+    analyzed = probed = 0
+    budget_stop = False
+    for fx in pickable:
+        if analyzed >= max_analyzed or probed >= max_probes:
+            break
+        left = fm.cycle_calls_left()
+        if left is not None and left < FIXTURE_CALL_RESERVE:
+            budget_stop = True
+            break
+        if not fm.background_fetches_allowed() and fm.get_request_mode() == "background":
+            budget_stop = True
+            break
+        probed += 1
+        if not get_fixture_odds(fx.get("fixture_id")):
+            continue
+        analyzed += 1
         candidates.extend(_picks_for_football_fixture(fx))
     picks = _rank_top(candidates, FOOTBALL_DAILY_CAP)
     ai = bool(os.getenv("XAI_API_KEY"))
     if picks:
         picks = _explain_with_grok(picks)
     picks = _apply_maxima_confianza(picks)
+    picks = _mark_top3(picks)
+    first_ko = None
+    for fx in pickable:
+        dt = _parse_kickoff(fx.get("kickoff") or fx.get("date"))
+        if dt and (first_ko is None or dt < first_ko):
+            first_ko = dt
+    coverage = {
+        "fixtures_today": len(fixtures),
+        "pickable": len(pickable),
+        "odds_probed": probed,
+        "analyzed": analyzed,
+        "budget_stop": budget_stop,
+        "complete": not budget_stop,
+        "first_kickoff": first_ko.strftime("%Y-%m-%d %H:%M") if first_ko else None,
+    }
     return {
         "date": today,
         "window": window,
         "timezone": "America/Bogota",
         "sport": "football",
         "league": league_id,
-        "fixtures": _public_fixtures(fixtures, "football"),
+        "fixtures": _public_fixtures(shown, "football"),
         "picks": picks,
+        "coverage": coverage,
         "ai_explained": bool(ai and picks),
         "empty_reason": None if fixtures else "No hay partidos programados hoy ni mañana en las competiciones seleccionadas.",
         "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
     }
+
+
+def _nba_trivial_under(c: dict) -> bool:
+    try:
+        line = float(c.get("book_line") if c.get("book_line") is not None else c.get("line"))
+    except (TypeError, ValueError):
+        return False
+    return (c.get("selection") == "Under") and line <= 0.5
+
+
+def _nba_not_started(c: dict) -> bool:
+    dt = _parse_kickoff(c.get("kickoff"))
+    if dt is None:
+        return True
+    return dt > datetime.now(BOGOTA) + timedelta(minutes=PICK_LEAD_MINUTES)
 
 
 def _build_nba() -> dict:
@@ -2016,6 +2175,11 @@ def _build_nba() -> dict:
     games = _trim_fixtures(games, NBA_MAX_FIXTURES)
     # Player props are the NBA daily product. Team totals remain a fallback only.
     candidates = nprops.collect_nba_prop_candidates(games)
+    # v9: an Under 0.5 (e.g. a center's 0 triples) is not a real bettable line:
+    # books price it at ~1.10 or do not offer it. Drop it.
+    candidates = [c for c in candidates if not _nba_trivial_under(c)]
+    # Do not issue picks for games that already tipped off.
+    candidates = [c for c in candidates if _nba_not_started(c)]
     pool = _rank_nba_props(candidates, 12, keep_score=True)
     grok_lines = {"attempted": False, "ok": False, "reason": "no_picks"}
     if pool:
@@ -2038,10 +2202,18 @@ def _build_nba() -> dict:
         for i, pick in enumerate(picks, start=1):
             pick["rank"] = i
             pick.pop("score", None)
+    picks = [p for p in picks if not _nba_trivial_under(p)]
+    for pick in picks:
+        # Estimated line (no sportsbook line found): honest cap at Media.
+        if pick.get("kind") == "player_prop" and pick.get("book_line") is None:
+            pick["confidence"] = min(int(pick.get("confidence") or 3), CONF_MEDIA)
+            pick["risk"] = "media"
+            pick["confidence_capped"] = "linea_estimada"
     ai = bool(os.getenv("XAI_API_KEY"))
     if picks:
         picks = _explain_with_grok(picks)
     picks = _apply_maxima_confianza(picks)
+    picks = _mark_top3(picks)
     empty = None
     if not games:
         empty = "No hay partidos NBA programados hoy ni mañana."
@@ -2068,8 +2240,10 @@ def _assemble_all(football: dict, nba_part: dict, league_id: Optional[int] = Non
     for i, pick in enumerate(picks, start=1):
         pick["rank"] = i
         pick.pop("score", None)
+    picks = _mark_top3(picks)
     return {
         "date": today,
+        "coverage": football.get("coverage"),
         "window": football.get("window") if football.get("fixtures") else nba_part.get("window"),
         "timezone": "America/Bogota",
         "sport": "all",
@@ -2238,6 +2412,10 @@ def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
             "games": raw.get("games"),
             "odds_verified": raw.get("odds_verified"),
             "odds_value": raw.get("odds_value"),
+            "edge": raw.get("edge"),
+            "model_prob": raw.get("model_prob"),
+            "fair_prob": raw.get("fair_prob"),
+            "bookmakers": raw.get("bookmakers"),
         })
         match = r.get("match") or ""
         if match and match not in seen_fx:
@@ -2258,7 +2436,7 @@ def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
         "sport": sport,
         "league": league_id,
         "fixtures": fixtures,
-        "picks": picks,
+        "picks": _mark_top3(picks),
         "ai_explained": False,
         "empty_reason": None,
         "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",

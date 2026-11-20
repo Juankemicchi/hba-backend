@@ -507,6 +507,7 @@ def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="a
         if cached is not None:
             return cached
 
+    skips_before = fm.skip_counter()
     found = None
     if team_id:
         found = {"id": int(team_id), "name": team}
@@ -587,7 +588,8 @@ def analyze_team_props(team=None, team_id=None, league=None, last_n=10, venue="a
         "h2h": (h2h.get("matches") if h2h else None),
         "lines": merged_lines,
     }
-    if cache_key:
+    # Do not cache a sample the quota guard truncated (blocked calls = empty stats).
+    if cache_key and fm.skip_counter() == skips_before:
         _props_set(cache_key, result)
     return result
 

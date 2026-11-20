@@ -166,6 +166,9 @@ def row_from_pick(date_str: str, pick: dict) -> dict:
             "odds_verified": pick.get("odds_verified"),
             "bet_name": pick.get("bet_name"),
             "odds_value": pick.get("odds_value"),
+            "edge": pick.get("edge"),
+            "model_prob": pick.get("model_prob"),
+            "fair_prob": pick.get("fair_prob"),
         },
     }
 
