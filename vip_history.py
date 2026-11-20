@@ -625,21 +625,44 @@ def publish_slate(data: dict) -> int:
         return 0
 
 
-def _fetch_football_final(fixture_id):
+# API-Football keeps filling /fixtures/statistics for a while after FT (on
+# 2026-11-20 Westerlo's corners read 3 about 20 min after FT; the final was 4).
+# So football picks are graded only once the match has been over for a while,
+# grading reads use a short cache, and every graded pick is re-checked once later.
+GRADE_SETTLE_MIN = 60          # minutes after the estimated FT before grading
+REGULAR_MATCH_MIN = 115        # kickoff -> FT incl. half-time and stoppage
+EXTRA_TIME_MIN = 40            # extra time + penalties
+RECHECK_AFTER_MIN = 120        # second look this long after the first grade
+RECHECK_WINDOW_H = 48
+VERIFIED_TAG = "verificado"
+GRADE_STATS_TTL = 20 * 60
+
+
+def _football_settled(pick: dict, status: str = "") -> bool:
+    dt = _kickoff_dt(pick.get("kickoff"))
+    if dt is None:
+        return False
+    minutes = REGULAR_MATCH_MIN + GRADE_SETTLE_MIN
+    if str(status).upper() in {"AET", "PEN"}:
+        minutes += EXTRA_TIME_MIN
+    return datetime.now(BOGOTA) >= dt + timedelta(minutes=minutes)
+
+
+def _fetch_football_final(fixture_id, force: bool = False):
     fid = int(fixture_id)
-    cached = _grade_fixture_cache.get(fid)
+    cached = _grade_fixture_cache.get((fid, force))
     if cached is not None:
         return cached
-    data = fm.api_get("/fixtures", {"id": fid}, ttl=15 * 60)
+    data = fm.api_get("/fixtures", {"id": fid}, ttl=15 * 60, force=force)
     item = (data.get("response") or [None])[0]
     status = (((item or {}).get("fixture") or {}).get("status") or {}).get("short") or ""
     status = str(status).upper()
     stats_resp = []
     if status in FINISHED_FOOTBALL:
-        stats = fm.api_get("/fixtures/statistics", {"fixture": fid}, ttl=fs.CACHE_TTL_FIXTURE)
+        stats = fm.api_get("/fixtures/statistics", {"fixture": fid}, ttl=GRADE_STATS_TTL, force=force)
         stats_resp = stats.get("response") or []
     result = (item, stats_resp)
-    _grade_fixture_cache[fid] = result
+    _grade_fixture_cache[(fid, force)] = result
     return result
 
 
@@ -700,17 +723,77 @@ def grade_row(row: dict) -> dict:
     sport = (row.get("sport") or "").lower()
     pick = dict(row)
     if sport in {"football", "futbol", "fútbol"}:
-        if not _kickoff_has_passed(pick):
-            return {"result": "pendiente", "note": "Kickoff pendiente", "actual": None, "units": None}
+        if not _football_settled(pick):
+            return {"result": "pendiente", "note": "Esperando estadística final", "actual": None, "units": None}
         fid = row.get("fixture_id")
         if not fid:
             return {"result": "pendiente", "note": "Sin fixture_id", "actual": None, "units": None}
         item, stats = _fetch_football_final(fid)
+        status = (((item or {}).get("fixture") or {}).get("status") or {}).get("short") or ""
+        if not _football_settled(pick, status):
+            return {"result": "pendiente", "note": "Esperando estadística final", "actual": None, "units": None}
         return evaluate_football(pick, item, stats)
     if sport == "nba":
         game = _nba_row_for_pick(pick)
         return evaluate_nba(pick, game)
     return {"result": "pendiente", "note": "Deporte no graduable", "actual": None, "units": None}
+
+
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BOGOTA)
+    return dt
+
+
+def recheck_graded(report: dict, limit: int = 120) -> None:
+    """Re-read final stats once for recently graded football picks and fix them if
+    the provider corrected the numbers (late corner/card updates)."""
+    now = datetime.now(BOGOTA)
+    rows = fetch_rows(limit=limit)
+    for row in rows:
+        if (row.get("sport") or "").lower() not in {"football", "futbol", "fútbol"}:
+            continue
+        if row.get("result") not in {"ganado", "perdido", "nulo"} or not row.get("fixture_id"):
+            continue
+        note = str(row.get("grade_note") or "")
+        if VERIFIED_TAG in note or "corregido" in note:
+            continue
+        graded_at = _parse_ts(row.get("graded_at"))
+        if graded_at is None:
+            continue
+        if now - graded_at > timedelta(hours=RECHECK_WINDOW_H):
+            continue
+        if now < graded_at + timedelta(minutes=RECHECK_AFTER_MIN):
+            continue
+        if not fm.background_fetches_allowed():
+            break
+        try:
+            item, stats = _fetch_football_final(row.get("fixture_id"), force=True)
+            again = evaluate_football(dict(row), item, stats)
+        except Exception:
+            report["errors"] += 1
+            continue
+        new_result = (again or {}).get("result") or "pendiente"
+        if new_result == "pendiente":
+            continue
+        changed = new_result != row.get("result")
+        base = again.get("note") or note
+        new_note = f"{base} (corregido tras revisión)" if changed else f"{base} · {VERIFIED_TAG}"
+        ok = set_result(row.get("pick_key"), new_result, again.get("units"), new_note, again.get("actual"))
+        report["rechecked"] = report.get("rechecked", 0) + 1
+        if ok and changed:
+            report["corrected"] = report.get("corrected", 0) + 1
+            print(
+                f"HBA-REGRADE {row.get('pick_key')} {row.get('result')}->{new_result} "
+                f"actual {row.get('actual_value')}->{again.get('actual')}",
+                flush=True,
+            )
 
 
 def grade_pending(limit: int = 200) -> dict:
@@ -746,6 +829,10 @@ def grade_pending(limit: int = 200) -> dict:
                 report["results"][result] = report["results"].get(result, 0) + 1
             else:
                 report["errors"] += 1
+        try:
+            recheck_graded(report)
+        except Exception:
+            report["errors"] += 1
     finally:
         fm.end_call_cycle("grade")
     return report
