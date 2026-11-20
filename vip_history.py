@@ -59,7 +59,7 @@ def _kickoff_has_passed(pick: dict) -> bool:
     return dt <= datetime.now(BOGOTA)
 
 
-DAILY_CAPS = {"football": 5, "nba": 2}
+DAILY_CAPS = {"football": 8, "nba": 2}
 
 
 def _today() -> str:
@@ -169,6 +169,7 @@ def row_from_pick(date_str: str, pick: dict) -> dict:
             "edge": pick.get("edge"),
             "model_prob": pick.get("model_prob"),
             "fair_prob": pick.get("fair_prob"),
+            "risk": pick.get("risk"),
         },
     }
 
@@ -595,23 +596,20 @@ def publish_slate(data: dict) -> int:
     rows = [r for r in rows if str(r.get("kickoff") or "")[:10] == str(date_str)[:10]]
     if not rows:
         return 0
-    # Freeze the daily card: keep already-published picks, and add new ones only
-    # while that sport is under its daily cap and the match has not started.
+    # v10 frozen card: once a sport has picks published for this day it never
+    # changes (no additions, removals or re-pricing). A sport with nothing published
+    # yet (e.g. NBA ready later than football) is added once, up to its cap.
     try:
         existing = [r for r in fetch_rows(limit=500) if str(r.get("pick_date") or "")[:10] == str(date_str)[:10]]
     except Exception:
-        existing = []
-    known = {r.get("pick_key") for r in existing}
+        return 0
+    published_sports = {(r.get("sport") or "").lower() for r in existing}
     per_sport: dict = {}
-    for r in existing:
-        sp = (r.get("sport") or "").lower()
-        per_sport[sp] = per_sport.get(sp, 0) + 1
     out = []
     for r in rows:
-        if r["pick_key"] in known:
-            out.append(r)
-            continue
         sp = (r.get("sport") or "").lower()
+        if sp in published_sports:
+            continue
         cap = DAILY_CAPS.get(sp, 5)
         if per_sport.get(sp, 0) >= cap:
             continue
@@ -619,6 +617,8 @@ def publish_slate(data: dict) -> int:
             continue
         per_sport[sp] = per_sport.get(sp, 0) + 1
         out.append(r)
+    if not out:
+        return 0
     try:
         return upsert_rows(out)
     except Exception:

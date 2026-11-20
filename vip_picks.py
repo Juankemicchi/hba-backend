@@ -254,17 +254,12 @@ def _publishable_slate(data: dict) -> Optional[dict]:
     cov = data.get("coverage") or {}
     if not cov or cov.get("complete", True):
         return data
-    soon = []
-    now = datetime.now(BOGOTA)
-    for p in data.get("picks") or []:
-        dt = _parse_kickoff(p.get("kickoff"))
-        if dt is not None and dt - now <= timedelta(hours=2):
-            soon.append(p)
-    if not soon:
+    # v10: the card is published once and never extended, so a partial scan waits
+    # until the first match is <= 60 min away, then publishes what qualified.
+    first = _parse_kickoff(cov.get("first_kickoff"))
+    if first is None or first - datetime.now(BOGOTA) > timedelta(minutes=60):
         return None
-    out = dict(data)
-    out["picks"] = soon
-    return out
+    return data
 
 
 def _log_slate(data: dict):
@@ -314,7 +309,8 @@ def _cache_set(key: str, data: dict):
             from vip_history import publish_slate
             pub = _publishable_slate(data)
             if pub:
-                publish_slate(pub)
+                if publish_slate(pub):
+                    _invalidate_history_memo()
         except Exception:
             pass
 
@@ -902,7 +898,7 @@ MAXIMA_OPP_SUPPORT = 70.0
 MATCH_SIDE_MIN = 55.0          # each team must back a match-level market on its own
 UNDER_GOALS_MAX_ODD = 1.55     # pricier goal unders = bookmaker sees risk -> Media at most
 UNDER_GOALS_HIGH_ODD_MIN_MODEL = 65.0
-FOOTBALL_DAILY_CAP = 5
+FOOTBALL_DAILY_CAP = 8
 NBA_DAILY_CAP = 2
 MAX_PICKS_PER_FIXTURE = 2
 CONF_ALTA = 4
@@ -2405,18 +2401,75 @@ def _schedule_refresh(sport: str, league_id: Optional[int], key: str):
     threading.Thread(target=_run, name=f"vip-refresh-{key[-24:]}", daemon=True).start()
 
 
+_hist_memo = {"ts": 0.0, "date": None, "rows": None}
+_HIST_MEMO_TTL = 60
+
+
+def _invalidate_history_memo():
+    _hist_memo.update({"ts": 0.0, "rows": None})
+
+
 def _history_rows_today() -> list[dict]:
+    today = _today()
+    if _hist_memo["rows"] is not None and _hist_memo["date"] == today \
+            and time.time() - _hist_memo["ts"] < _HIST_MEMO_TTL:
+        return list(_hist_memo["rows"])
     try:
         from vip_history import fetch_rows
-        today = _today()
         rows = fetch_rows(limit=500, only_pending=False)
-        return [r for r in rows if str(r.get("pick_date") or "")[:10] == today]
+        rows = [r for r in rows if str(r.get("pick_date") or "")[:10] == today]
     except Exception:
-        return []
+        return list(_hist_memo["rows"] or []) if _hist_memo["date"] == today else []
+    _hist_memo.update({"ts": time.time(), "date": today, "rows": rows})
+    return list(rows)
 
 
 def _history_has_today() -> bool:
     return bool(_history_rows_today())
+
+
+def _frozen_status(row: dict, now: datetime) -> str:
+    res = (row.get("result") or "pendiente").lower()
+    if res in {"ganado", "perdido", "nulo"}:
+        return "finalizado"
+    dt = _parse_kickoff(row.get("kickoff"))
+    if dt is not None and dt <= now:
+        return "en_juego"
+    return "por_jugar"
+
+
+def _order_frozen(picks: list[dict]) -> list[dict]:
+    """Deterministic order from frozen values only (edge x confidence, then kickoff),
+    so the card and its Top 3 never reshuffle during the day."""
+    picks = _mark_top3(picks)
+    picks.sort(key=lambda p: (-(p.get("value_score") or 0), -(int(p.get("confidence") or 0)),
+                              str(p.get("kickoff") or ""), str(p.get("match") or ""),
+                              str(p.get("market_label") or "")))
+    for i, p in enumerate(picks, start=1):
+        p["rank"] = i
+    return picks
+
+
+def _frozen_card(sport: str, league_id: Optional[int]) -> Optional[dict]:
+    """v10: once today's card is published, every view serves it unchanged."""
+    rows = _history_rows_today()
+    if not rows:
+        return None
+    sports = {(r.get("sport") or "").lower() for r in rows}
+    if sport == "nba" and "nba" not in sports:
+        return None
+    if sport in {"football", "all"} and "football" not in sports:
+        return None
+    out = _slate_from_history(sport, league_id)
+    if out is None:
+        out = {
+            "date": _today(), "window": "today", "timezone": "America/Bogota",
+            "sport": sport, "league": league_id, "fixtures": [], "picks": [],
+            "frozen": True, "from_history": True, "cached": True,
+            "empty_reason": "La tarjeta fija de hoy no tiene picks de esta liga.",
+            "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
+        }
+    return out
 
 
 def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
@@ -2438,16 +2491,8 @@ def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
     picks = []
     fixtures = []
     seen_fx = set()
-    ranked = sorted(
-        rows,
-        key=lambda r: (
-            0 if r.get("maxima_confianza") else 1,
-            -(int(r.get("confidence") or 0)),
-        ),
-    )
-    fb_rows = [r for r in ranked if (r.get("sport") or "").lower() != "nba"][:FOOTBALL_DAILY_CAP]
-    nba_rows = [r for r in ranked if (r.get("sport") or "").lower() == "nba"][:NBA_DAILY_CAP]
-    for r in fb_rows + nba_rows:
+    now = datetime.now(BOGOTA)
+    for r in rows:
         raw = r.get("raw") or {}
         if isinstance(raw, str):
             try:
@@ -2482,6 +2527,10 @@ def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
             "model_prob": raw.get("model_prob"),
             "fair_prob": raw.get("fair_prob"),
             "bookmakers": raw.get("bookmakers"),
+            "risk": raw.get("risk"),
+            "result": r.get("result") or "pendiente",
+            "match_status": _frozen_status(r, now),
+            "frozen": True,
         })
         match = r.get("match") or ""
         if match and match not in seen_fx:
@@ -2502,7 +2551,8 @@ def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
         "sport": sport,
         "league": league_id,
         "fixtures": fixtures,
-        "picks": _mark_top3(picks),
+        "picks": _order_frozen(picks),
+        "frozen": True,
         "ai_explained": False,
         "empty_reason": None,
         "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
@@ -2519,6 +2569,9 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
     if sport not in {"all", "nba", "football"}:
         sport = "all"
     today = _today()
+    frozen = _frozen_card(sport, league_id)
+    if frozen:
+        return frozen
     key = _cache_key(sport, league_id, today, "auto")
     found = _cache_lookup(key, allow_stale=True)
     remaining = fm.quota_remaining()
