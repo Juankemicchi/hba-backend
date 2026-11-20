@@ -278,7 +278,7 @@ def _log_slate(data: dict):
                 f"{p.get('kickoff')}|{p.get('match')}|{p.get('market_label')}|{p.get('selection')}"
                 f" {p.get('line') if p.get('line') is not None else ''}|odd={p.get('avg_odd')}"
                 f"|conf={p.get('confidence')}|max={bool(p.get('maxima_confianza'))}"
-                f"|edge={p.get('edge')}|top3={p.get('top3_rank')}"
+                f"|edge={p.get('edge')}|top3={p.get('top3_rank')}|chk={p.get('maxima_check')}"
             )
         print(
             f"HBA-SLATE sport={data.get('sport')} window={data.get('window')} n={len(rows)} "
@@ -1557,6 +1557,7 @@ def _picks_for_football_fixture_compute(fx: dict) -> list[dict]:
                 entity_id=fx.get("fixture_id"),
                 logo=fx.get("home_logo"),
                 note=f"Tasa BTTS de {home_name} en casa y {away_name} de visitante; ambas deben coincidir.",
+                recent_flags=[hv[0], av[0]],
             )
             attached = _attach_odds(
                 cand, _odds_lookup(odds_index, ODDS_BTTS, odds_side, None),
@@ -1905,6 +1906,14 @@ def _rank_top(candidates: list[dict], limit: int = 5) -> list[dict]:
 
 def _sample_recent_hits(pick: dict) -> bool:
     """The most recent match in the sample must have hit the line."""
+    if pick.get("market") == "btts":
+        # Both teams' most recent match at this venue must agree with the pick.
+        flags = pick.get("recent_flags") or []
+        want = 1 if pick.get("selection") == "Sí" else 0
+        try:
+            return len(flags) == 2 and all(int(round(float(f))) == want for f in flags)
+        except (TypeError, ValueError):
+            return False
     values = pick.get("sample_values") or pick.get("recent_values") or []
     line = pick.get("line")
     side = pick.get("selection")
@@ -1918,16 +1927,16 @@ def _sample_recent_hits(pick: dict) -> bool:
     return v <= line if side == "Under" else v > line
 
 
-def _is_maxima_confianza(pick: dict) -> bool:
-    """Strict badge for real-money use. Never awarded to 1X2 form or unsourced NBA estimates."""
+def _maxima_block(pick: dict) -> Optional[str]:
+    """None when the pick meets every Máxima confianza rule, else the first rule it fails."""
     if (pick.get("sport") or "football") != "football":
-        return False
+        return "solo_futbol"
     market = (pick.get("market") or "").lower()
     bet_name = (pick.get("bet_name") or "").lower()
     if market in {"1x2", "moneyline"} or bet_name in {"match winner"} or pick.get("bet_id") == 1:
-        return False
+        return "1x2_excluido"
     if not pick.get("odds_verified"):
-        return False
+        return "sin_cuota_verificada"
     try:
         hit = float(pick.get("hit_rate") or 0)
         games = int(pick.get("games") or 0)
@@ -1935,25 +1944,43 @@ def _is_maxima_confianza(pick: dict) -> bool:
         odd = float(pick.get("avg_odd") or 0)
         edge = float(pick.get("edge") or 0)
     except (TypeError, ValueError):
-        return False
-    if hit < 80 or games < 12 or books < 3 or odd < 1.40 or edge < MIN_EDGE:
-        return False
+        return "datos"
+    if hit < 80:
+        return f"hit<80({hit})"
+    if games < 12:
+        return f"muestra<12({games})"
+    if books < 3:
+        return f"casas<3({books})"
+    if odd < 1.40:
+        return "cuota<1.40"
+    if edge < MIN_EDGE:
+        return "edge"
     if int(pick.get("confidence") or 0) < 5:
-        return False
+        return f"confianza<5({pick.get('confidence')})"
     # v8: opponent must back it, venue split must be real, no risky-priced goal unders.
-    if pick.get("venue_split") is False or pick.get("under_goals_high_odd"):
-        return False
+    if pick.get("venue_split") is False:
+        return "sin_split_local_visitante"
+    if pick.get("under_goals_high_odd"):
+        return "under_goles_cuota_alta"
     if pick.get("opp_support") is not None and float(pick["opp_support"]) < MAXIMA_OPP_SUPPORT:
-        return False
+        return f"rival<70({pick.get('opp_support')})"
     if not _sample_recent_hits(pick):
-        return False
-    return True
+        return "ultimo_partido_fallo"
+    return None
+
+
+def _is_maxima_confianza(pick: dict) -> bool:
+    """Strict badge for real-money use. Never awarded to 1X2 form or unsourced NBA estimates."""
+    return _maxima_block(pick) is None
 
 
 def _apply_maxima_confianza(picks: list[dict]) -> list[dict]:
     for pick in picks:
-        pick["maxima_confianza"] = _is_maxima_confianza(pick)
+        block = _maxima_block(pick)
+        pick["maxima_confianza"] = block is None
+        pick["maxima_check"] = block or "ok"
         pick.pop("sample_values", None)
+        pick.pop("recent_flags", None)
         pick.pop("recent_values", None)
     return picks
 
