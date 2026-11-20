@@ -59,6 +59,9 @@ def _kickoff_has_passed(pick: dict) -> bool:
     return dt <= datetime.now(BOGOTA)
 
 
+DAILY_CAPS = {"football": 5, "nba": 2}
+
+
 def _today() -> str:
     return datetime.now(BOGOTA).date().isoformat()
 
@@ -555,6 +558,11 @@ def list_history(limit_days: int = 60) -> dict:
     if limit_days and limit_days > 0:
         cutoff = (datetime.now(BOGOTA).date() - timedelta(days=int(limit_days))).isoformat()
         rows = [r for r in rows if str(r.get("pick_date") or "") >= cutoff]
+    # Show each day only its own matches (legacy rows could hold future fixtures).
+    rows = [
+        r for r in rows
+        if not r.get("kickoff") or str(r.get("kickoff"))[:10] == str(r.get("pick_date") or "")[:10]
+    ]
     days: dict[str, list] = {}
     for row in rows:
         days.setdefault(str(row.get("pick_date") or ""), []).append(row)
@@ -580,8 +588,36 @@ def publish_slate(data: dict) -> int:
         return 0
     rows = [row_from_pick(date_str, p) for p in picks if isinstance(p, dict)]
     rows = [r for r in rows if r.get("match") and r.get("market_label") and r.get("selection")]
+    # Each day's history holds only that day's own matches (Bogotá calendar).
+    rows = [r for r in rows if str(r.get("kickoff") or "")[:10] == str(date_str)[:10]]
+    if not rows:
+        return 0
+    # Freeze the daily card: keep already-published picks, and add new ones only
+    # while that sport is under its daily cap and the match has not started.
     try:
-        return upsert_rows(rows)
+        existing = [r for r in fetch_rows(limit=500) if str(r.get("pick_date") or "")[:10] == str(date_str)[:10]]
+    except Exception:
+        existing = []
+    known = {r.get("pick_key") for r in existing}
+    per_sport: dict = {}
+    for r in existing:
+        sp = (r.get("sport") or "").lower()
+        per_sport[sp] = per_sport.get(sp, 0) + 1
+    out = []
+    for r in rows:
+        if r["pick_key"] in known:
+            out.append(r)
+            continue
+        sp = (r.get("sport") or "").lower()
+        cap = DAILY_CAPS.get(sp, 5)
+        if per_sport.get(sp, 0) >= cap:
+            continue
+        if _kickoff_has_passed(r):
+            continue
+        per_sport[sp] = per_sport.get(sp, 0) + 1
+        out.append(r)
+    try:
+        return upsert_rows(out)
     except Exception:
         return 0
 

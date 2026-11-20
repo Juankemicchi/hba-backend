@@ -45,3 +45,13 @@ Variables de entorno (opcionales; si faltan, el sitio público sigue funcionando
 - `GET /api/vip/picks?sport=all|nba|football&league=` — top 5 del día (caché 45 min).
 - `POST /api/vip/slip` — analiza picks o una captura.
 - `POST /api/vip/chat` — chat con herramientas de estadísticas reales.
+
+## VIP picks engine v8
+
+- Team markets use the team's last 15 games at the same venue (home/away). If that split has fewer than 8 games, all games are used and confidence is capped at 4/5 (Alta).
+- The opponent's mirror record must back every team pick (e.g. Team Under 1.5 goals needs the opponent to concede under 2 in at least 60% of its games; 70% for Máxima confianza).
+- Match markets need each team to back the line on its own (55%+).
+- 1X2 crosses the venue win rate with the opponent's venue loss rate and requires a better goal difference per game.
+- Value: model probability = 50% empirical + 50% Bayesian (prior = no-vig market probability, k=8). Published only if edge >= 4 p.p. (max 25).
+- Goal unders priced above 1.55 are capped at Media (3/5) and dropped if the model is under 65%.
+- Daily card: up to 5 football + 2 NBA picks, ranked by edge x confidence, max 2 per match. History keeps only each day's own matches and freezes the card once published.

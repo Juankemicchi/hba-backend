@@ -122,8 +122,11 @@ def list_vip_competitions() -> dict:
     }
 
 
+CACHE_VERSION = "v8"
+
+
 def _cache_key(sport: str, league_id: Optional[int], date_str: str, window: str) -> str:
-    return f"v7|{date_str}|{sport}|{league_id or 'all'}|{window}"
+    return f"{CACHE_VERSION}|{date_str}|{sport}|{league_id or 'all'}|{window}"
 
 
 def _cache_fresh(item: Optional[dict], now: Optional[float] = None, allow_stale: bool = False):
@@ -250,11 +253,15 @@ def _cache_set(key: str, data: dict):
         except Exception:
             pass
     _supabase_cache_set(key, item)
-    try:
-        from vip_history import publish_slate
-        publish_slate(data)
-    except Exception:
-        pass
+    # History = the official daily card only: main football (all leagues) and NBA
+    # slates for today. Per-league and "upcoming" previews are never published.
+    if data.get("league") in (None, "", 0) and data.get("window", "today") == "today" \
+            and data.get("sport") in {"football", "nba"}:
+        try:
+            from vip_history import publish_slate
+            publish_slate(data)
+        except Exception:
+            pass
 
 
 def _xai_client() -> Optional[OpenAI]:
@@ -341,6 +348,10 @@ def _statistical_reason(pick: dict) -> str:
         f"{pick.get('market_label')} {line_txt} acertó el {pick.get('hit_rate')}% "
         f"({pick.get('hits')}/{pick.get('games')})."
     )
+    if pick.get("opp_support") is not None and pick.get("entity_side") in {"home", "away"} and pick.get("market") != "1x2":
+        text += f" El rival respalda la línea en el {pick['opp_support']}% de sus partidos."
+    elif pick.get("market") == "1x2" and pick.get("opp_support") is not None:
+        text += f" El rival perdió el {round(pick['opp_support'], 1)}% de sus partidos en esa condición."
     if pick.get("bet_name"):
         mercado = pick["bet_name"]
         if pick.get("odds_value"):
@@ -350,8 +361,8 @@ def _statistical_reason(pick: dict) -> str:
         text += (
             f" Cuota promedio {pick['avg_odd']} "
             f"({pick.get('odd_min')}–{pick.get('odd_max')}, {pick.get('bookmakers')} casas). "
-            f"Edge conservador {pick.get('edge')} p.p. frente a la probabilidad implícita "
-            f"({pick.get('implied_prob')}%), ajustado por el tamaño de la muestra."
+            f"Probabilidad HBA {pick.get('model_prob')}% vs {pick.get('fair_prob')}% de la casa sin margen: "
+            f"edge {pick.get('edge')} p.p., ajustado por el tamaño de la muestra."
         )
         if pick.get("edge_flag") and pick.get("edge_raw") is not None:
             text += f" El edge crudo de la muestra sería {pick['edge_raw']} p.p."
@@ -393,6 +404,10 @@ def _explain_with_grok(picks: list[dict]) -> list[dict]:
             "line_label": pick.get("line_label"),
             "book_line": pick.get("book_line"),
             "hit_rate_season": pick.get("hit_rate_season"),
+            "model_prob": pick.get("model_prob"),
+            "fair_prob": pick.get("fair_prob"),
+            "opp_support": pick.get("opp_support"),
+            "venue_split": pick.get("venue_split"),
         })
     prompt = (
         "Eres el analista VIP de HBA. Escribe UNA frase corta en español por cada pick, "
@@ -401,7 +416,8 @@ def _explain_with_grok(picks: list[dict]) -> list[dict]:
         "y deja claro que la línea es una LÍNEA ESTIMADA de HBA, no una cuota de casa, "
         "salvo que venga book_line, en cuyo caso cita esa 'línea en casas' sin nombrar fuentes ni proveedores. "
         "No presentes una estimación como cuota real. No menciones Grok, APIs, ESPN ni URLs. "
-        "Si el pick es de fútbol: menciona la cuota promedio y el edge conservador. "
+        "Si el pick es de fútbol: menciona la cuota promedio, la probabilidad HBA (model_prob) frente a la "
+        "de la casa sin margen (fair_prob) y, si viene opp_support, que el rival también respalda la línea. "
         "No inventes estadísticas, lesiones, cuotas ni noticias. No des consejos de apuesta. "
         "Devuelve un JSON array de strings, nada más.\n\n"
         + json.dumps(compact, ensure_ascii=False)
@@ -745,7 +761,7 @@ def _analyze_football_team(team_id: int, league_id: int, venue: Optional[str] = 
     with _team_hist_lock:
         _team_hist[key] = data
     # Fill the dashboard default (last 10) from already-cached fixture stats.
-    if LAST_N != 10:
+    if LAST_N != 10 and (venue or "all") == "all":
         try:
             fs.analyze_team_props(
                 team_id=int(team_id),
@@ -778,11 +794,25 @@ MIN_BOOKS = 3
 MIN_BOOKS_PAIR = 2
 MIN_HIT = 60
 MIN_GAMES = 5
-MIN_EDGE = 0.0
+# v8 value model: edge is measured against the no-vig (fair) probability and
+# must clear MIN_EDGE percentage points after Bayesian shrinkage.
+MIN_EDGE = 4.0
 MAX_EDGE = 25.0
 OUTLIER_DEV = 0.25
 PAIR_AGREE = 0.10
 SHRINK_K = 8
+DEFAULT_MARGIN = 1.04          # assumed overround when the opposite side is missing
+VENUE_MIN_SAMPLE = 8           # home/away split needs 8+ games, else fall back to all games
+MIN_OPP_SUPPORT = 60.0         # opponent's mirror record must back the pick
+MAXIMA_OPP_SUPPORT = 70.0
+MATCH_SIDE_MIN = 55.0          # each team must back a match-level market on its own
+UNDER_GOALS_MAX_ODD = 1.55     # pricier goal unders = bookmaker sees risk -> Media at most
+UNDER_GOALS_HIGH_ODD_MIN_MODEL = 65.0
+FOOTBALL_DAILY_CAP = 5
+NBA_DAILY_CAP = 2
+MAX_PICKS_PER_FIXTURE = 2
+CONF_ALTA = 4
+CONF_MEDIA = 3
 
 # API-Football /odds bet IDs — strict whitelist (full-time, no Asian/handicap/halves).
 ODDS_MATCH_WINNER = 1
@@ -845,9 +875,9 @@ MATCH_MARKETS = {
 
 # Team-specific markets must name the team in the label.
 TEAM_MARKETS_VIP = {
-    "corners_for": {"label": "córners a favor", "min_line": 3.5, "row_key": "corners_for", "bet_home": ODDS_CORNERS_HOME, "bet_away": ODDS_CORNERS_AWAY},
-    "goals_for": {"label": "goles anotados", "min_line": 1.5, "row_key": "goals_for", "bet_home": ODDS_GOALS_HOME, "bet_away": ODDS_GOALS_AWAY},
-    "cards": {"label": "tarjetas", "min_line": 1.5, "row_key": "cards", "bet_home": ODDS_CARDS_HOME, "bet_away": ODDS_CARDS_AWAY},
+    "corners_for": {"label": "córners a favor", "min_line": 3.5, "row_key": "corners_for", "opp_key": "corners_against", "opp_label": "córners que concede", "bet_home": ODDS_CORNERS_HOME, "bet_away": ODDS_CORNERS_AWAY},
+    "goals_for": {"label": "goles anotados", "min_line": 1.5, "row_key": "goals_for", "opp_key": "goals_against", "opp_label": "goles que concede", "bet_home": ODDS_GOALS_HOME, "bet_away": ODDS_GOALS_AWAY},
+    "cards": {"label": "tarjetas", "min_line": 1.5, "row_key": "cards", "opp_key": "cards_against", "opp_label": "tarjetas que provoca en sus rivales", "bet_home": ODDS_CARDS_HOME, "bet_away": ODDS_CARDS_AWAY},
 }
 
 
@@ -1063,48 +1093,134 @@ def _available_lines(odds_index: dict, bet_id: Optional[int], min_line: float) -
 
 
 def _shrunk_hit(hits: float, games: int, implied_pct: float, k: int = SHRINK_K) -> float:
-    """Blend the sample hit rate toward the market implied probability."""
+    """Bayesian estimate: Beta prior centred on the fair market probability, k pseudo-games."""
     if games <= 0:
         return implied_pct
     phat = 100.0 * float(hits) / float(games)
     return (games * phat + k * implied_pct) / (games + k)
 
 
-def _attach_odds(cand: dict, info: Optional[dict]) -> Optional[dict]:
+def _complement_sides(bet_id: Optional[int], side: str) -> list[str]:
+    try:
+        bid = int(bet_id)
+    except (TypeError, ValueError):
+        return []
+    if bid in OU_BET_IDS:
+        return ["Under" if side == "Over" else "Over"]
+    if bid == ODDS_BTTS:
+        return ["No" if side == "Yes" else "Yes"]
+    if bid == ODDS_MATCH_WINNER:
+        return [s for s in ("Home", "Draw", "Away") if s != side]
+    return []
+
+
+def _fair_prob(odds_index: Optional[dict], bet_id, side: Optional[str], line, avg: float) -> tuple[float, bool]:
+    """No-vig probability (%) for one side, from the consensus prices of every side.
+
+    If a complementary side is missing, assume a standard overround instead.
+    """
+    implied = 100.0 / float(avg)
+    comp = _complement_sides(bet_id, side or "") if odds_index and side else []
+    if not comp:
+        return implied / DEFAULT_MARGIN, False
+    total = 1.0 / float(avg)
+    for other in comp:
+        info = _odds_lookup(odds_index, bet_id, other, line)
+        if not info or not info.get("avg"):
+            return implied / DEFAULT_MARGIN, False
+        total += 1.0 / float(info["avg"])
+    if total <= 1.0:
+        return implied, True
+    return 100.0 * (1.0 / float(avg)) / total, True
+
+
+def _confidence_v8(p_model: float, team_hit: float, games: int, opp_support: Optional[float], edge: float) -> int:
+    if games < MIN_GAMES:
+        return 2
+    if (
+        p_model >= 72
+        and team_hit >= 80
+        and games >= 12
+        and (opp_support is None or opp_support >= MAXIMA_OPP_SUPPORT)
+        and edge >= MIN_EDGE + 1
+    ):
+        return 5
+    if p_model >= 66:
+        return 4
+    if p_model >= 58:
+        return 3
+    return 2
+
+
+def _is_under_goals(cand: dict) -> bool:
+    return (cand.get("market") in {"goals_for", "goals_total"}) and cand.get("selection") == "Under"
+
+
+def _attach_odds(cand: dict, info: Optional[dict], odds_index: Optional[dict] = None,
+                 odds_side: Optional[str] = None, model: Optional[dict] = None) -> Optional[dict]:
+    """Value check v8: blend the empirical rate with a Bayesian estimate and compare it
+    with the no-vig market probability. Publish only if edge >= MIN_EDGE p.p."""
     if not info or not info.get("verified"):
         return None
     if info.get("n", 0) < MIN_BOOKS_PAIR or info.get("avg", 0) < MIN_ODD:
         return None
     avg = float(info["avg"])
     implied = 100.0 / avg
+    side = odds_side or cand.get("selection")
+    fair, devigged = _fair_prob(odds_index, info.get("bet_id"), side, cand.get("line"), avg)
     hit = float(cand["hit_rate"])
     games = int(cand.get("games") or 0)
     hits = float(cand.get("hits") or 0)
-    raw_edge = round(hit - implied, 1)
-    adj_hit = _shrunk_hit(hits, games, implied)
-    edge = round(adj_hit - implied, 1)
-    if edge < MIN_EDGE:
+    model = model or {}
+    m_hits = float(model.get("hits", hits))
+    m_games = int(model.get("games", games))
+    if m_games <= 0:
         return None
-    # Conservative edge still above 25% is almost certainly a mismatch or a tiny sample.
-    if edge > MAX_EDGE:
+    p_emp = 100.0 * m_hits / m_games
+    p_bayes = _shrunk_hit(m_hits, m_games, fair)
+    p_model = 0.5 * p_emp + 0.5 * p_bayes
+    raw_edge = round(hit - fair, 1)
+    edge = round(p_model - fair, 1)
+    if edge < MIN_EDGE or edge > MAX_EDGE:
         return None
+    opp_support = model.get("opp_support")
+    venue_fallback = bool(model.get("venue_fallback"))
+    conf = _confidence_v8(p_model, hit, games, opp_support, edge)
+    if venue_fallback:
+        conf = min(conf, CONF_ALTA)
+    if _is_under_goals(cand) and avg > UNDER_GOALS_MAX_ODD:
+        # The book prices this under as risky: Media at most, and drop weak ones.
+        if p_model < UNDER_GOALS_HIGH_ODD_MIN_MODEL:
+            return None
+        conf = min(conf, CONF_MEDIA)
+        cand["under_goals_high_odd"] = True
     cand["avg_odd"] = avg
     cand["odd_min"] = info["min"]
     cand["odd_max"] = info["max"]
     cand["bookmakers"] = info["n"]
     cand["bookmaker_names"] = info.get("books") or []
     cand["implied_prob"] = round(implied, 1)
+    cand["fair_prob"] = round(fair, 1)
+    cand["devigged"] = devigged
+    cand["model_prob"] = round(p_model, 1)
     cand["edge"] = edge
     cand["edge_raw"] = raw_edge
-    cand["hit_rate_adj"] = round(adj_hit, 1)
+    cand["hit_rate_adj"] = round(p_model, 1)
     cand["edge_flag"] = raw_edge > MAX_EDGE
     cand["odds_verified"] = True
     cand["bet_id"] = info.get("bet_id")
     cand["bet_name"] = info.get("bet_name")
     cand["odds_value"] = info.get("odds_value")
-    cand["score"] = edge * 2.0 + adj_hit * 0.4 + min(games, 12)
-    cand["risk"] = _risk(hit, games)
-    cand["confidence"] = _confidence(hit, games, cand.get("selection") or "")
+    if opp_support is not None:
+        cand["opp_support"] = round(float(opp_support), 1)
+        cand["opp_games"] = model.get("opp_games")
+    cand["venue_split"] = not venue_fallback
+    if model.get("strength_gap") is not None:
+        cand["strength_gap"] = model.get("strength_gap")
+    cand["confidence"] = conf
+    cand["risk"] = _risk(p_model, games)
+    # Rank by edge x confidence; model probability breaks ties.
+    cand["score"] = edge * conf + p_model * 0.01
     return cand
 
 
@@ -1121,10 +1237,44 @@ def _base_pick(fx: dict, **extra) -> dict:
     return pick
 
 
-def _build_ou_candidate(fx, values, line, side, market, label, entity, entity_id, entity_side, logo, note, odds_info):
+def _build_ou_candidate(fx, values, line, side, market, label, entity, entity_id, entity_side, logo, note,
+                        odds_info, odds_index=None, ctx=None):
+    """ctx keys: opp_values (mirror record), side_values (match markets: per-team lists),
+    venue_fallback, strength_gap."""
+    ctx = ctx or {}
     hits, games, hit = _hit_at_line(values, line, side)
     if games < MIN_GAMES or hit < MIN_HIT:
         return None
+    model = {"hits": hits, "games": games, "venue_fallback": ctx.get("venue_fallback")}
+    opp_values = ctx.get("opp_values")
+    if opp_values is not None:
+        o_hits, o_games, o_rate = _hit_at_line(opp_values, line, side)
+        if o_games < MIN_GAMES or o_rate < MIN_OPP_SUPPORT:
+            return None
+        model.update({
+            "hits": hits + o_hits,
+            "games": games + o_games,
+            "opp_support": o_rate,
+            "opp_games": o_games,
+        })
+    side_values = ctx.get("side_values")
+    if side_values:
+        rates = []
+        for vals in side_values:
+            _h, g, r = _hit_at_line(vals, line, side)
+            if g < MIN_GAMES or r < MATCH_SIDE_MIN:
+                return None
+            rates.append(r)
+        model["opp_support"] = min(rates)
+        model["opp_games"] = min(len(v) for v in side_values)
+    gap = ctx.get("strength_gap")
+    if gap is not None:
+        model["strength_gap"] = gap
+        # Do not back a team total against the strength picture.
+        if side == "Over" and gap <= -0.75:
+            return None
+        if side == "Under" and gap >= 0.75:
+            return None
     cand = _base_pick(
         fx,
         market=market,
@@ -1143,10 +1293,11 @@ def _build_ou_candidate(fx, values, line, side, market, label, entity, entity_id
         avg=round(sum(values) / len(values), 2) if values else None,
         sample_values=list(values),
     )
-    return _attach_odds(cand, odds_info)
+    return _attach_odds(cand, odds_info, odds_index=odds_index, odds_side=side, model=model)
 
 
-def _best_ou_from_values(fx, values, min_line, bet_id, odds_index, market, label, entity, entity_id, entity_side, logo, note):
+def _best_ou_from_values(fx, values, min_line, bet_id, odds_index, market, label, entity, entity_id, entity_side,
+                         logo, note, ctx=None):
     if len(values) < MIN_GAMES or not bet_id:
         return None
     target = _median_line(values, min_line)
@@ -1164,6 +1315,7 @@ def _best_ou_from_values(fx, values, min_line, bet_id, odds_index, market, label
             info = _odds_lookup(odds_index, bet_id, side, line)
             cand = _build_ou_candidate(
                 fx, values, line, side, market, label, entity, entity_id, entity_side, logo, note, info,
+                odds_index=odds_index, ctx=ctx,
             )
             if cand:
                 options.append(cand)
@@ -1187,13 +1339,38 @@ def _picks_for_football_fixture(fx: dict) -> list[dict]:
     return result
 
 
+def _venue_analysis(team_id: int, league_id: int, venue: str) -> tuple[Optional[dict], bool]:
+    """Last 15 games at the same venue as this fixture. Falls back to all games
+    (and flags it, which caps confidence at Alta) if the split has < 8 games."""
+    split = _analyze_football_team(team_id, league_id, venue=venue)
+    if split and len(split.get("matches") or []) >= VENUE_MIN_SAMPLE:
+        return split, False
+    full = _analyze_football_team(team_id, league_id)
+    if full and (full.get("matches") or []):
+        return full, True
+    return split, True
+
+
+def _rows_with(analysis: dict, key: str) -> list[dict]:
+    return [r for r in (analysis.get("matches") or []) if isinstance(r, dict) and r.get(key) is not None]
+
+
+def _strength(analysis: dict) -> Optional[float]:
+    """Goal difference per game over the venue sample (opponent strength proxy)."""
+    rows = _rows_with(analysis, "goals_for")
+    rows = [r for r in rows if r.get("goals_against") is not None]
+    if len(rows) < MIN_GAMES:
+        return None
+    return sum(float(r["goals_for"]) - float(r["goals_against"]) for r in rows) / len(rows)
+
+
 def _picks_for_football_fixture_compute(fx: dict) -> list[dict]:
     home_id, away_id = fx.get("home_id"), fx.get("away_id")
     league_id = fx.get("league_id")
     if not home_id or not away_id or not league_id:
         return []
-    home_a = _analyze_football_team(home_id, league_id)
-    away_a = _analyze_football_team(away_id, league_id)
+    home_a, home_fb = _venue_analysis(home_id, league_id, "home")
+    away_a, away_fb = _venue_analysis(away_id, league_id, "away")
     if not home_a or not away_a:
         return []
     odds_index = get_fixture_odds(fx.get("fixture_id"))
@@ -1203,76 +1380,111 @@ def _picks_for_football_fixture_compute(fx: dict) -> list[dict]:
     candidates = []
     home_name = fx.get("home")
     away_name = fx.get("away")
+    any_fallback = home_fb or away_fb
+    s_home, s_away = _strength(home_a), _strength(away_a)
+    venue_txt = "local en casa y visitante fuera" if not any_fallback else "todos sus partidos (muestra local/visitante corta)"
 
-    # Match-level markets: pool both teams' recent match totals, exclude missing stats.
+    # Match-level markets: home team's home games + away team's away games.
+    # Each side must back the market on its own (no one team carrying the other).
     for key, spec in MATCH_MARKETS.items():
-        values = _match_values(home_a, spec["row_key"]) + _match_values(away_a, spec["row_key"])
+        hv = _match_values(home_a, spec["row_key"])
+        av = _match_values(away_a, spec["row_key"])
         note = (
-            f"Muestra combinada de los partidos recientes de {home_name} y {away_name}; "
-            "se omiten juegos sin estadística."
+            f"Muestra de {home_name} y {away_name} ({venue_txt}); ambos equipos deben respaldar "
+            "la línea por separado. Se omiten juegos sin estadística."
         )
         cand = _best_ou_from_values(
-            fx, values, spec["min_line"], spec["bet_id"], odds_index,
+            fx, hv + av, spec["min_line"], spec["bet_id"], odds_index,
             key, spec["label"],
             f"{home_name} / {away_name}", fx.get("fixture_id"), "match",
             fx.get("home_logo"), note,
+            ctx={"side_values": [hv, av], "venue_fallback": any_fallback},
         )
         if cand:
             candidates.append(cand)
 
-    # Team-specific markets, clearly named.
-    for analysis, side, team_name, team_id, logo in (
-        (home_a, "home", home_name, home_id, fx.get("home_logo")),
-        (away_a, "away", away_name, away_id, fx.get("away_logo")),
+    # Team-specific markets: team record at this venue + opponent's mirror record
+    # (e.g. Team Under 1.5 goals needs the opponent to concede < 2 often too).
+    for analysis, opp_a, side, team_name, opp_name, team_id, logo, fb, gap in (
+        (home_a, away_a, "home", home_name, away_name, home_id, fx.get("home_logo"), any_fallback,
+         None if s_home is None or s_away is None else round(s_home - s_away, 2)),
+        (away_a, home_a, "away", away_name, home_name, away_id, fx.get("away_logo"), any_fallback,
+         None if s_home is None or s_away is None else round(s_away - s_home, 2)),
     ):
         bet_key = "bet_home" if side == "home" else "bet_away"
         for key, spec in TEAM_MARKETS_VIP.items():
             values = _match_values(analysis, spec["row_key"])
+            opp_values = _match_values(opp_a, spec["opp_key"])
             label = f"{team_name} {spec['label']}"
             cand = _best_ou_from_values(
                 fx, values, spec["min_line"], spec.get(bet_key), odds_index,
                 key, label, team_name, team_id, side, logo,
-                "Mercado del equipo, no del partido. Solo partidos con estadística reportada.",
+                f"Mercado del equipo, no del partido. {team_name} "
+                f"{'en casa' if side == 'home' else 'de visitante'} y respaldo de {opp_name} "
+                f"({spec['opp_label']}).",
+                ctx={
+                    "opp_values": opp_values,
+                    "venue_fallback": fb,
+                    "strength_gap": gap if key in {"goals_for", "corners_for"} else None,
+                },
             )
             if cand:
                 candidates.append(cand)
 
-    # BTTS (match)
-    hm = _market_from_props(home_a, "btts")
-    am = _market_from_props(away_a, "btts")
-    if hm and am and int(hm.get("games") or 0) >= MIN_GAMES and int(am.get("games") or 0) >= MIN_GAMES:
-        yes = (float(hm.get("yes_rate") or 0) + float(am.get("yes_rate") or 0)) / 2.0
-        games = min(int(hm["games"]), int(am["games"]))
-        for side, hit, odds_side in (("Sí", yes, "Yes"), ("No", 100.0 - yes, "No")):
+    # BTTS (match): each team's BTTS rate at its venue must agree.
+    hv = _match_values(home_a, "btts")
+    av = _match_values(away_a, "btts")
+    if len(hv) >= MIN_GAMES and len(av) >= MIN_GAMES:
+        h_yes, a_yes = 100.0 * sum(hv) / len(hv), 100.0 * sum(av) / len(av)
+        for side, odds_side, h_rate, a_rate in (("Sí", "Yes", h_yes, a_yes), ("No", "No", 100 - h_yes, 100 - a_yes)):
+            if min(h_rate, a_rate) < MATCH_SIDE_MIN:
+                continue
+            games = len(hv) + len(av)
+            hits = int(round(h_rate / 100.0 * len(hv) + a_rate / 100.0 * len(av)))
+            hit = round(100.0 * hits / games, 1)
             if hit < MIN_HIT:
                 continue
-            hits = int(round(hit / 100.0 * games))
             cand = _base_pick(
                 fx,
                 market="btts",
                 market_label="Ambos anotan",
                 selection=side,
                 line=None,
-                hit_rate=round(hit, 1),
+                hit_rate=hit,
                 hits=hits,
                 games=games,
                 sample_size=games,
                 entity=f"{home_name} / {away_name}",
                 entity_id=fx.get("fixture_id"),
                 logo=fx.get("home_logo"),
-                note="Promedio de la tasa BTTS de ambos equipos en sus partidos recientes.",
+                note=f"Tasa BTTS de {home_name} en casa y {away_name} de visitante; ambas deben coincidir.",
             )
-            attached = _attach_odds(cand, _odds_lookup(odds_index, ODDS_BTTS, odds_side, None))
+            attached = _attach_odds(
+                cand, _odds_lookup(odds_index, ODDS_BTTS, odds_side, None),
+                odds_index=odds_index, odds_side=odds_side,
+                model={"hits": hits, "games": games, "opp_support": min(h_rate, a_rate),
+                       "opp_games": min(len(hv), len(av)), "venue_fallback": any_fallback},
+            )
             if attached:
                 candidates.append(attached)
 
-    # 1X2 using recent win rate vs bookmaker odds
-    for analysis, side, team_name, team_id, logo, odds_side in (
-        (home_a, "home", home_name, home_id, fx.get("home_logo"), "Home"),
-        (away_a, "away", away_name, away_id, fx.get("away_logo"), "Away"),
+    # 1X2: win rate at this venue + opponent's loss rate at its venue + strength gate.
+    for analysis, opp_a, side, team_name, team_id, logo, odds_side, s_me, s_opp in (
+        (home_a, away_a, "home", home_name, home_id, fx.get("home_logo"), "Home", s_home, s_away),
+        (away_a, home_a, "away", away_name, away_id, fx.get("away_logo"), "Away", s_away, s_home),
     ):
-        rate, wins, games = _form_win_rate(analysis)
-        if rate is None or games < MIN_GAMES or rate < MIN_HIT:
+        rows = _rows_with(analysis, "result")
+        opp_rows = _rows_with(opp_a, "result")
+        games, opp_games = len(rows), len(opp_rows)
+        if games < MIN_GAMES or opp_games < MIN_GAMES:
+            continue
+        wins = sum(1 for r in rows if r.get("result") == "W")
+        opp_losses = sum(1 for r in opp_rows if r.get("result") == "L")
+        rate = round(100.0 * wins / games, 1)
+        opp_loss_rate = 100.0 * opp_losses / opp_games
+        if rate < MIN_HIT or opp_loss_rate < 45:
+            continue
+        if s_me is None or s_opp is None or s_me <= s_opp:
             continue
         cand = _base_pick(
             fx,
@@ -1288,9 +1500,18 @@ def _picks_for_football_fixture_compute(fx: dict) -> list[dict]:
             entity_id=team_id,
             entity_side=side,
             logo=logo,
-            note="Hit rate = % de victorias del equipo en su forma reciente (mismos partidos que usa HBA).",
+            note=(
+                f"% de victorias de {team_name} {'en casa' if side == 'home' else 'de visitante'}, "
+                "cruzado con las derrotas del rival en su condición y la diferencia de gol."
+            ),
         )
-        attached = _attach_odds(cand, _odds_lookup(odds_index, ODDS_MATCH_WINNER, odds_side, None))
+        attached = _attach_odds(
+            cand, _odds_lookup(odds_index, ODDS_MATCH_WINNER, odds_side, None),
+            odds_index=odds_index, odds_side=odds_side,
+            model={"hits": wins + opp_losses, "games": games + opp_games,
+                   "opp_support": opp_loss_rate, "opp_games": opp_games,
+                   "venue_fallback": any_fallback, "strength_gap": round(s_me - s_opp, 2)},
+        )
         if attached:
             candidates.append(attached)
 
@@ -1553,20 +1774,26 @@ def _rank_nba_props(candidates: list[dict], limit: int = 5, keep_score: bool = F
 
 
 def _rank_top(candidates: list[dict], limit: int = 5) -> list[dict]:
-    # Avoid two nearly identical markets from the same match when possible.
+    """Quality over quantity: rank by edge x confidence, cap picks per match."""
     seen = set()
+    per_fixture: dict = {}
     ranked = []
     for cand in sorted(candidates, key=lambda c: (-(c.get("score") or 0), -(c.get("games") or 0))):
-        # Top 5 football value picks must have a verified bookmaker market and a capped edge.
+        # Football value picks must have a verified bookmaker market and an edge in range.
         if cand.get("sport") == "football":
             if not cand.get("odds_verified"):
                 continue
-            if cand.get("edge") is None or cand.get("edge") > MAX_EDGE:
+            edge = cand.get("edge")
+            if edge is None or edge < MIN_EDGE or edge > MAX_EDGE:
                 continue
-        key = (cand.get("fixture_id") or cand.get("match"), cand.get("market"), cand.get("entity"))
+        fid = cand.get("fixture_id") or cand.get("match")
+        key = (fid, cand.get("market"), cand.get("entity"))
         if key in seen:
             continue
+        if per_fixture.get(fid, 0) >= MAX_PICKS_PER_FIXTURE:
+            continue
         seen.add(key)
+        per_fixture[fid] = per_fixture.get(fid, 0) + 1
         ranked.append(cand)
         if len(ranked) >= limit:
             break
@@ -1610,7 +1837,14 @@ def _is_maxima_confianza(pick: dict) -> bool:
         edge = float(pick.get("edge") or 0)
     except (TypeError, ValueError):
         return False
-    if hit < 80 or games < 12 or books < 3 or odd < 1.40 or edge <= 0:
+    if hit < 80 or games < 12 or books < 3 or odd < 1.40 or edge < MIN_EDGE:
+        return False
+    if int(pick.get("confidence") or 0) < 5:
+        return False
+    # v8: opponent must back it, venue split must be real, no risky-priced goal unders.
+    if pick.get("venue_split") is False or pick.get("under_goals_high_odd"):
+        return False
+    if pick.get("opp_support") is not None and float(pick["opp_support"]) < MAXIMA_OPP_SUPPORT:
         return False
     if not _sample_recent_hits(pick):
         return False
@@ -1722,9 +1956,10 @@ def _build_football(league_id: Optional[int]) -> dict:
     today_ids = None if league_id else ALL_LEAGUE_IDS
     fixtures = _upcoming_only(_collect_football_fixtures(league_id, [today], ids=today_ids))
     if not fixtures:
-        upcoming_days = [
-            (datetime.now(BOGOTA).date() + timedelta(days=i)).isoformat()
-            for i in range(1, 4)
+        # Preview only (never published to the history): tomorrow's games, one day
+        # to save quota. Overnight builds skip the preview entirely.
+        upcoming_days = [] if datetime.now(BOGOTA).hour < 7 else [
+            (datetime.now(BOGOTA).date() + timedelta(days=1)).isoformat()
         ]
         fixtures = _upcoming_only(_collect_football_fixtures(league_id, upcoming_days))
         if fixtures:
@@ -1733,7 +1968,7 @@ def _build_football(league_id: Optional[int]) -> dict:
     candidates = []
     for fx in fixtures:
         candidates.extend(_picks_for_football_fixture(fx))
-    picks = _rank_top(candidates, 5)
+    picks = _rank_top(candidates, FOOTBALL_DAILY_CAP)
     ai = bool(os.getenv("XAI_API_KEY"))
     if picks:
         picks = _explain_with_grok(picks)
@@ -1772,11 +2007,10 @@ def _build_nba() -> dict:
     # games whose kickoff falls on the requested Bogotá calendar day(s).
     games = _nba_games_on_bogota_days([today])
     if not games:
-        upcoming_days = [
-            (datetime.now(BOGOTA).date() + timedelta(days=i)).isoformat()
-            for i in range(1, 3)
+        upcoming_days = [] if datetime.now(BOGOTA).hour < 7 else [
+            (datetime.now(BOGOTA).date() + timedelta(days=1)).isoformat()
         ]
-        games = _nba_games_on_bogota_days(upcoming_days)
+        games = _nba_games_on_bogota_days(upcoming_days) if upcoming_days else []
         if games:
             window = "upcoming"
     games = _trim_fixtures(games, NBA_MAX_FIXTURES)
@@ -1787,16 +2021,16 @@ def _build_nba() -> dict:
     if pool:
         pool, grok_lines = nprops.enrich_props_with_grok_lines(pool)
         pool = [p for p in pool if not p.get("book_conflict")]
-    picks = _rank_nba_props(pool, 5)
+    picks = _rank_nba_props(pool, NBA_DAILY_CAP)
     for pick in picks:
         pick["kickoff"] = _kickoff_label(pick.get("kickoff"))
-    if len(picks) < 5:
+    if len(picks) < NBA_DAILY_CAP:
         fallback = []
         for game in games:
             fallback.extend(_nba_team_candidates(game.get("home"), game.get("home_id"), game))
             fallback.extend(_nba_team_candidates(game.get("away"), game.get("away_id"), game))
-        for extra in _rank_top(fallback, 5):
-            if len(picks) >= 5:
+        for extra in _rank_top(fallback, NBA_DAILY_CAP):
+            if len(picks) >= NBA_DAILY_CAP:
                 break
             if any((p.get("market"), p.get("entity")) == (extra.get("market"), extra.get("entity")) for p in picks):
                 continue
@@ -1828,7 +2062,9 @@ def _build_nba() -> dict:
 
 def _assemble_all(football: dict, nba_part: dict, league_id: Optional[int] = None) -> dict:
     today = _today()
-    picks = nprops._mix_all_picks(football.get("picks") or [], nba_part.get("picks") or [], 5)
+    picks = nprops._mix_all_picks(
+        football.get("picks") or [], nba_part.get("picks") or [], FOOTBALL_DAILY_CAP + NBA_DAILY_CAP
+    )
     for i, pick in enumerate(picks, start=1):
         pick["rank"] = i
         pick.pop("score", None)
@@ -1969,8 +2205,9 @@ def _slate_from_history(sport: str, league_id: Optional[int]) -> Optional[dict]:
             -(int(r.get("confidence") or 0)),
         ),
     )
-    limit = 5
-    for r in ranked[:limit]:
+    fb_rows = [r for r in ranked if (r.get("sport") or "").lower() != "nba"][:FOOTBALL_DAILY_CAP]
+    nba_rows = [r for r in ranked if (r.get("sport") or "").lower() == "nba"][:NBA_DAILY_CAP]
+    for r in fb_rows + nba_rows:
         raw = r.get("raw") or {}
         if isinstance(raw, str):
             try:
@@ -2133,7 +2370,8 @@ def warm_picks_cache(force: bool = False) -> dict:
         remaining_now = fm.quota_remaining()
         # Per-league slates are optional and were the long-running quota burn.
         skip_leagues = (
-            tight
+            datetime.now(BOGOTA).hour < 7
+            or tight
             or not fm.cycle_budget_left()
             or (remaining_now is not None and remaining_now < 2000)
         )
@@ -2169,7 +2407,7 @@ def warm_picks_cache(force: bool = False) -> dict:
 def _has_today_slate() -> bool:
     """True when a same-day VIP slate is already in memory or the cache file."""
     today = _today()
-    prefix = f"v7|{today}|"
+    prefix = f"{CACHE_VERSION}|{today}|"
     now = time.time()
     with _cache_lock:
         items = list(_memory_cache.items())

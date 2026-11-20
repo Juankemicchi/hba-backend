@@ -266,7 +266,10 @@ def _guard_blocks_fetch(path: str) -> bool:
     """Return True when this call must not hit the live API."""
     mode = get_request_mode()
     remaining = quota_remaining()
-    if path == "/status" and remaining is None:
+    # /status does not count against the API-Football daily quota. Never block it,
+    # otherwise a process stuck under the background threshold never sees the
+    # 19:00 Bogotá reset and keeps blocking itself.
+    if path == "/status":
         return False
     if not cycle_budget_left() and mode != "user_stats":
         return True
