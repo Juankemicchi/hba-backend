@@ -2450,15 +2450,55 @@ def _order_frozen(picks: list[dict]) -> list[dict]:
     return picks
 
 
+PENDING_MSG = "Los picks de hoy se publican pronto"
+
+
+def _pending_payload(sport: str, league_id: Optional[int], reason: str = PENDING_MSG,
+                     frozen: bool = False) -> dict:
+    return {
+        "date": _today(), "window": "today", "timezone": "America/Bogota",
+        "sport": sport, "league": league_id, "fixtures": [], "picks": [],
+        "pending": not frozen, "frozen": frozen, "cached": True,
+        "empty_reason": reason,
+        "disclaimer": "+18. Apuesta bajo tu propia responsabilidad.",
+    }
+
+
+def _football_settled_empty() -> Optional[str]:
+    """Reason text when today's full football scan finished with no qualifying picks."""
+    try:
+        found = _cache_lookup(_cache_key("football", None, _today(), "auto"), allow_stale=True)
+    except Exception:
+        found = None
+    data = (found or {}).get("data") if found else None
+    if not isinstance(data, dict):
+        return None
+    if data.get("window") == "upcoming" or not data.get("fixtures"):
+        return "Hoy no hay partidos de fútbol en las ligas que analiza HBA."
+    cov = data.get("coverage") or {}
+    if cov.get("complete") and not (data.get("picks") or []):
+        return "Hoy ningún partido de fútbol pasó los filtros de valor de HBA."
+    return None
+
+
 def _frozen_card(sport: str, league_id: Optional[int]) -> Optional[dict]:
     """v10: once today's card is published, every view serves it unchanged."""
     rows = _history_rows_today()
-    if not rows:
-        return None
     sports = {(r.get("sport") or "").lower() for r in rows}
     if sport == "nba" and "nba" not in sports:
         return None
     if sport in {"football", "all"} and "football" not in sports:
+        # Football is "settled" without picks when the full scan found none with value.
+        empty_reason = _football_settled_empty()
+        if not empty_reason:
+            return None
+        if sport == "all" and "nba" in sports:
+            out = _slate_from_history("nba", None)
+            if out:
+                out["sport"] = "all"
+                return out
+        return _pending_payload(sport, league_id, empty_reason, frozen=True)
+    if not rows:
         return None
     out = _slate_from_history(sport, league_id)
     if out is None:
@@ -2572,6 +2612,8 @@ def get_daily_picks(sport: str = "all", league_id: Optional[int] = None) -> dict
     frozen = _frozen_card(sport, league_id)
     if frozen:
         return frozen
+    # v10: no live preview before the daily card is published.
+    return _pending_payload(sport, league_id)
     key = _cache_key(sport, league_id, today, "auto")
     found = _cache_lookup(key, allow_stale=True)
     remaining = fm.quota_remaining()
