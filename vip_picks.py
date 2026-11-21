@@ -2095,16 +2095,37 @@ def _value_score(pick: dict) -> float:
     return round(max(edge, 0.0) * conf + p_model * 0.01, 3)
 
 
+def _top3_score(pick: dict) -> float:
+    """Rank Máxima picks by hit rate plus edge (both already in percentage points)."""
+    try:
+        hit = float(pick.get("hit_rate") or 0)
+    except (TypeError, ValueError):
+        hit = 0.0
+    try:
+        edge = float(pick.get("edge") or 0)
+    except (TypeError, ValueError):
+        edge = 0.0
+    return round(hit + edge, 3)
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        return float(val or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 def _mark_top3(picks: list[dict]) -> list[dict]:
-    """Top 3 del día: strongest picks by edge x confidence. Labels stay honest:
-    only picks that pass _is_maxima_confianza carry maxima_confianza."""
+    """Top 3 del día: only genuine Máxima, ranked by hit rate + edge.
+    Never fill empty slots with non-Máxima picks; labels stay honest."""
     for p in picks:
         p.pop("top3_rank", None)
         p["value_score"] = _value_score(p)
+    maxima = [p for p in picks if p.get("maxima_confianza")]
     ranked = sorted(
-        picks,
-        key=lambda p: (-(p.get("value_score") or 0), -(int(p.get("confidence") or 0)),
-                       -(float(p.get("hit_rate") or 0))),
+        maxima,
+        key=lambda p: (-_top3_score(p), -_safe_float(p.get("edge")),
+                       -int(p.get("games") or 0)),
     )
     for i, p in enumerate(ranked[:3], start=1):
         p["top3_rank"] = i
